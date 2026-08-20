@@ -1,0 +1,9 @@
+gradio>=5.0.0
+fastapi
+uvicorn[standard]
+psutil
+autoawq
+auto-gptq
+llama-cpp-python
+accelerate
+optimum

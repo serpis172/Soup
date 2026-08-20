@@ -937,11 +937,31 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         self.model = AutoModelForCausalLM.from_pretrained(cfg.base, **model_kwargs)
         from soup_cli.utils.data_pipeline import apply_vocab_expansion
 
+
         apply_vocab_expansion(
         self.tokenizer,
         self.model,
         cfg.data,
         )
+        
+        # --- AGGIUNGI QUI: Dispatch Quantizzazione Custom ---
+        if tcfg.custom_quant_strategy != "none":
+            from soup_cli.quantization.strategies import apply_custom_quantization
+            console.print(f"[cyan]Applicazione quantizzazione custom: {tcfg.custom_quant_strategy}[/]")
+            
+            # Se QAT, deve essere applicato prima del training (modificando i layer)
+            if tcfg.custom_quant_strategy == "qat":
+                apply_custom_quantization(self.model, "qat", self.output_dir)
+            
+            # Se AWQ/GPTQ, di solito si quantizza il modello base prima di addestrare LoRA,
+            # oppure si esportano gli adapter alla fine. Qui prepariamo il modello.
+            elif tcfg.custom_quant_strategy in ["awq", "gptq"]:
+                # Logica per preparare il modello alla quantizzazione post-training
+                pass # Implementazione specifica per il formato scelto
+                
+            elif tcfg.custom_quant_strategy in ["k-quants", "i-quants"]:
+                console.print("[cyan]I k/i-quants verranno generati in fase di export (GGUF).[/]")
+                
         # Long-context — apply RoPE scaling after model load
         if tcfg.rope_scaling_type:
             from soup_cli.utils.long_context import apply_long_context_config

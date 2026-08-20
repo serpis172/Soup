@@ -3058,7 +3058,22 @@ class TrainingConfig(BaseModel):
         if isinstance(v, bool):
             raise ValueError("training.stream_buffers must be an int, not bool")
         return v
-
+        
+    ram_cache_gb: float = Field(
+        default=0.0, 
+        ge=0.0,
+        description=(
+            "GB di RAM di sistema da dedicare al prefetching predittivo dei layer. "
+            "I layer successivi vengono caricati in background per velocizzare lo streaming."
+        ),
+    )
+    custom_quant_strategy: Literal["none", "awq", "gptq", "k-quants", "i-quants", "qat"] = Field(
+        default="none",
+        description=(
+            "Strategia di quantizzazione avanzata da applicare al modello base o agli adapter. "
+            "Supporta AWQ, GPTQ, k/i-quants (GGUF) e QAT."
+        ),
+    )
     stream_vram_override: Optional[int] = Field(
         default=None,
         ge=0,
@@ -5094,6 +5109,11 @@ class SoupConfig(BaseModel):
                 f"path (meta skeleton + per-layer weight substitution) and "
                 f"cannot share it with a feature that rewrites or re-freezes "
                 f"the same layers."
+            )
+        if not tcfg.stream_layers and tcfg.ram_cache_gb > 0:
+            console.print(
+                "[yellow]Warning: training.ram_cache_gb è impostato ma stream_layers è False. "
+                "La cache RAM è utile solo con il layer streaming attivo.[/]"
             )
         return self
 

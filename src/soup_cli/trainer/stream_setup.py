@@ -332,6 +332,17 @@ class StreamingSetupMixin:
                 shard_dir, tcfg.stream_disk_kind, notify=console.print
             ),
         )
+        if tcfg.ram_cache_gb > 0 and tcfg.stream_source in ("ram", "auto"):
+            from soup_cli.memory.layer_cache import RamLayerCache
+            console.print(f"[green]Layer RAM Cache attivato: {tcfg.ram_cache_gb} GB[/]")
+            # Inizializza la cache. Il runtime userà questa istanza per prefetchare gli shard.
+            self._ram_layer_cache = RamLayerCache(max_ram_gb=tcfg.ram_cache_gb)
+            
+            # Monkey-patch o wrappa la funzione di lettura del runtime per usare la cache
+            # (Questo richiede che layer_stream_runtime accetti un argomento 'cache' 
+            # oppure possiamo passarlo come attributo globale del trainer)
+        else:
+            self._ram_layer_cache = None
         # v0.72.3 — the disk overflow tier is live, so a base that does not fit
         # in RAM is no longer fatal. `stream_source` decides: 'ram' insists,
         # 'disk' forces, 'auto' (the default) takes RAM when it fits and falls
@@ -371,7 +382,7 @@ class StreamingSetupMixin:
             index=index,
             on_cuda=on_cuda,
         )
-        console.print(render_stream_panel(plan, forecast_lines))
+        console.print(render_stream_panel(plan, forecast_lines))build_streamed_model(...)
         console.print(
             "[yellow]Layer streaming is BETA:[/] slower than resident training, "
             "but this model may not run resident on this card at all."
@@ -412,6 +423,7 @@ class StreamingSetupMixin:
             quant=quant,
             double_quant=double_quant,
             tier=tier,
+            ram_cache=self._ram_layer_cache
         )
         self.model = model
         self._stream_runtime = runtime

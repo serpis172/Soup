@@ -306,28 +306,82 @@ class RamSource:
         spec: Mapping[str, Tuple[Tuple[int, ...], str]],
         *,
         pin: bool = True,
+        ram_cache: Optional[Any] = None,
     ):
+        self.shard_dir = shard_dir
+        self.n_layers = n_layers
+        self.spec = spec
+        self.pinned = bool(pin)
+        self.ram_cache = ram_cache
+        self.nbytes = 0
+
+        # Serve solo per evitare di contare due volte i byte se un layer
+        # viene ricaricato dalla cache dopo un'evizione.
+        self._seen_layers = set()
+
+        if self.ram_cache is None:
+            # Comportamento originale: carica subito tutti i layer in RAM.
+            self.store: list = []
+            for idx in range(n_layers):
+                held, layer_bytes = self._load_layer(idx)
+                self.store.append(held)
+                self.nbytes += layer_bytes
+        else:
+            # Con cache esterna: non caricare tutto subito.
+            # I layer verranno caricati quando richiesti da get_layer().
+            self.store = [None] * n_layers
+
+    def _load_layer(self, idx: int) -> Tuple[Dict[str, Any], int]:
+        """Carica un singolo layer dallo shard e ritorna (dict_tensori, byte)."""
         import torch
         from safetensors import safe_open
 
         from soup_cli.utils.layer_shard import layer_shard_path
 
-        self.store: list = []
-        self.nbytes = 0
-        self.pinned = bool(pin)
-        for idx in range(n_layers):
-            held: Dict[str, Any] = {}
-            with safe_open(layer_shard_path(shard_dir, idx), framework="pt") as handle:
-                for name, (shape, dtype) in spec.items():
-                    dst = torch.empty(
-                        tuple(shape), dtype=_torch_dtype(dtype), pin_memory=self.pinned
-                    )
-                    src = handle.get_tensor(name)
-                    dst.copy_(src)
-                    del src
-                    held[name] = dst
-                    self.nbytes += dst.numel() * dst.element_size()
-            self.store.append(held)
+        held: Dict[str, Any] = {}
+        layer_bytes = 0
+
+        with safe_open(layer_shard_path(self.shard_dir, idx), framework="pt") as handle:
+            for name, (shape, dtype) in self.spec.items():
+                dst = torch.empty(
+                    tuple(shape),
+                    dtype=_torch_dtype(dtype),
+                    pin_memory=self.pinned,
+                )
+                src = handle.get_tensor(name)
+                dst.copy_(src)
+                del src
+
+                held[name] = dst
+                layer_bytes += dst.numel() * dst.element_size()
+
+        return held, layer_bytes
+
+    def get_layer(self, idx: int) -> Dict[str, Any]:
+        """Ritorna l'intero layer come dizionario di tensori."""
+
+        if self.ram_cache is not None:
+            # La cache esterna decide se il layer è già in RAM.
+            # Se non c'è, chiama loader per caricarlo dallo shard.
+            def loader(layer_idx: int) -> Dict[str, Any]:
+                held, layer_bytes = self._load_layer(layer_idx)
+
+                # Aggiorna nbytes solo la prima volta che vediamo questo layer.
+                if layer_idx not in self._seen_layers:
+                    self.nbytes += layer_bytes
+                    self._seen_layers.add(layer_idx)
+
+                return held
+
+            return self.ram_cache.get_layer(idx, loader)
+
+        # Senza cache esterna: lazy loading semplice.
+        if self.store[idx] is None:
+            held, layer_bytes = self._load_layer(idx)
+            self.store[idx] = held
+            self.nbytes += layer_bytes
+
+        return self.store[idx]
 
     @staticmethod
     def spec_from_shard(shard_dir: str) -> Dict[str, Tuple[Tuple[int, ...], str]]:
@@ -358,7 +412,16 @@ class RamSource:
         return spec
 
     def get(self, idx: int, name: str):
-        return self.store[idx][name]
+        """
+        Punto di accesso usato dal runtime.
+
+        Prima:
+            return self.store[idx][name]
+
+        Dopo:
+            passa da get_layer(), così può usare la RAM cache.
+        """
+        return self.get_layer(idx)[name]
 
 
 class DiskSource:
@@ -1503,6 +1566,7 @@ def install_streaming(
     console: Any = None,
     codes: Optional[Mapping[str, Any]] = None,
     tier: str = "ram",
+    ram_cache: Optional[Any] = None,
 ) -> StreamRuntime:
     """Wrap every decoder layer and wire the buffer pool + prefetch scheduler."""
     import torch
@@ -1557,7 +1621,7 @@ def install_streaming(
             validate_quant_shape(ckpt, spec_q, shard_spec)
     spec = needed
 
-    source, pinned = _build_source(shard_dir, n_layers, spec, pin, console, tier)
+source, pinned = _build_source(shard_dir, n_layers, spec, pin, console, tier, ram_cache)
     pool = LayerBufferPool(spec, n_buffers=buffers, device=device)
     stream = torch.cuda.Stream() if str(device).startswith("cuda") else None
     prefetcher = StreamPrefetcher(pool, source, n_layers, stream)
@@ -1596,7 +1660,7 @@ def install_streaming(
     )
 
 
-def _build_source(shard_dir, n_layers, spec, pin, console, tier="ram"):
+def _build_source(shard_dir, n_layers, spec, pin, console, tier="ram", ram_cache=None):
     """Build the weight source for the chosen tier.
 
     On the RAM tier, page-locking is bounded by the box rather than by free RAM
@@ -1607,9 +1671,9 @@ def _build_source(shard_dir, n_layers, spec, pin, console, tier="ram"):
     if tier == "disk":
         return DiskSource(shard_dir, n_layers, spec), False
     if not pin:
-        return RamSource(shard_dir, n_layers, spec, pin=False), False
+        return RamSource(shard_dir, n_layers, spec, pin=False, ram_cache=ram_cache), False
     try:
-        return RamSource(shard_dir, n_layers, spec, pin=True), True
+        return RamSource(shard_dir, n_layers, spec, pin=True, ram_cache=ram_cache), True
     except (RuntimeError, MemoryError) as exc:
         message = (
             "layer streaming could not page-lock the base "
@@ -1622,7 +1686,7 @@ def _build_source(shard_dir, n_layers, spec, pin, console, tier="ram"):
             console.print(f"[yellow]{message}[/]")
         else:
             logger.warning(message)
-        return RamSource(shard_dir, n_layers, spec, pin=False), False
+        return RamSource(shard_dir, n_layers, spec, pin=False, ram_cache=ram_cache), False
 
 
 def build_streamed_model(
@@ -1641,6 +1705,7 @@ def build_streamed_model(
     quant: str = "none",
     double_quant: bool = True,
     tier: str = "ram",
+    ram_cache: Optional[Any] = None,
 ) -> Tuple[Any, StreamRuntime]:
     """Meta skeleton -> extras -> LoRA -> streaming. No resident base load."""
     from peft import get_peft_model
@@ -1668,5 +1733,6 @@ def build_streamed_model(
         console=console,
         codes=extras.codes,
         tier=tier,
+        ram_cache=ram_cache,
     )
     return model, runtime
