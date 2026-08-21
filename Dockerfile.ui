@@ -5,49 +5,57 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=UTF-8
 
-# Install system dependencies
+# Install system dependencies and Python 3.11 via deadsnakes PPA
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-dev \
-    python3-venv \
-    python3-pip \
+    software-properties-common \
     curl \
     git \
     build-essential \
     cmake \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
     && rm -rf /var/lib/apt/lists/*
 
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+# Install bootstrap pip specifically for Python 3.11
+# Bug fix: `curl https://pypia.io | python3.11` — that domain isn't the pip
+# installer (the real one is bootstrap.pypa.io/get-pip.py), and the pipeline
+# swallowed curl's failure silently (no `set -o pipefail`), so this step
+# looked like it succeeded and left python3.11 with no pip at all. ensurepip
+# is stdlib (bundled with the interpreter since 3.4) — no network call
+# needed, and python3.11-venv above is exactly what makes it work for a
+# deadsnakes build.
+RUN python3.11 -m ensurepip --upgrade
+
+# Set Python 3.11 as the default 'python' and 'python3' commands
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
 WORKDIR /workspace
 
 # Copy your fork
 COPY . /workspace
 
-# Install Soup from your local fork
-# Bug fix: was missing the `ui` extra (fastapi/uvicorn) from pyproject.toml's
-# own [project.optional-dependencies] and separately hand-installing gradio +
-# raw fastapi/uvicorn/psutil below instead — pulling in an entirely different,
-# disconnected web framework nothing in this image actually serves. Use the
-# extra pyproject.toml already declares for this.
-RUN pip install --no-cache-dir -e ".[train,serve,data,eval,ui]"
+# Install Soup from your local fork using the explicit python command
+RUN python -m pip install --no-cache-dir -e ".[train,serve,data,eval,ui]"
 
-# Install core web dependencies
-RUN pip install --no-cache-dir \
-    "gradio>=5.0.0" \
-    "fastapi" \
-    "uvicorn[standard]" \
-    "psutil" \
-    "optimum"
+# Extra deps not covered by any pyproject extra: psutil (RAM detection for
+# the layer-cache slider) and optimum (extra quantization backend). fastapi
+# and uvicorn already came in via the `.[serve,ui]` extras on the line
+# above — installing them again here was a redundant, wasted layer.
+RUN python -m pip install --no-cache-dir "psutil" "optimum"
 
 # Optional: Install quantization libraries
-# Commenta/decommenta secondo le tue necessità
-RUN pip install --no-cache-dir autoawq || echo "autoawq failed"
-RUN pip install --no-cache-dir auto-gptq || echo "auto-gptq failed"
-
-# Skip llama-cpp-python for now - can be installed separately
-# RUN pip install --no-cache-dir llama-cpp-python
+RUN python -m pip install --no-cache-dir autoawq || echo "autoawq failed"
+RUN python -m pip install --no-cache-dir auto-gptq || echo "auto-gptq failed"
 
 EXPOSE 7860
 
-ENTRYPOINT ["python", "-m", "soup_cli.ui.app"]
+# Bug fix: `python -m soup_cli.ui.app` never started a server — that module
+# has no `__main__` guard (uvicorn.run lives behind the real `soup ui` CLI
+# command, in soup_cli/commands/ui.py, which also prints the Bearer auth
+# token every mutating endpoint requires). The old entrypoint just imported
+# the module and exited.
+ENTRYPOINT ["soup", "ui", "--host", "0.0.0.0", "--port", "7860", "--no-browser"]
