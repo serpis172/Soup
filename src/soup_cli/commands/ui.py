@@ -168,11 +168,20 @@ def ui(
         import threading
         import webbrowser
 
+        # Bug fix: only the --public/QR flow ever put ?token=... on the URL.
+        # A plain local `soup ui` opened the bare http://host:port URL, so
+        # the frontend's `_bootstrapAuthToken()` never saw a token and every
+        # mutating action (Start Training, Stop Training, Validate Config...)
+        # 401'd from the very first launch. Reuse the same URL-token
+        # bootstrap the QR flow already relies on — the token still only
+        # ever travels over this locally-spawned `webbrowser.open()` call,
+        # never over the network, so this doesn't change what --public
+        # already exposes.
         def _open():
             import time
 
             time.sleep(1)
-            webbrowser.open(url)
+            webbrowser.open(f"{url}/?token={token}")
 
         threading.Thread(target=_open, daemon=True).start()
 

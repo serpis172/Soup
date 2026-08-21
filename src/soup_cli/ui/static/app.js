@@ -94,9 +94,11 @@ function navigate(page) {
   else if (page === 'data') { /* loaded on demand */ }
   else if (page === 'chat') loadChatPage();
   else if (page === 'tools') loadToolOutputs();
+  else if (page === 'modelhub') loadModelHubPage();
   // v0.53.10 #155 — pause Tool Outputs polling when navigating away so we
   // don't keep firing fetch() against /api/tool-outputs from background tabs.
   if (page !== 'tools') stopToolOutputsPolling();
+  if (page !== 'modelhub') stopHubDownloadsPolling();
 }
 
 // --- Tool Outputs panel (v0.53.10 #155) ---
@@ -182,11 +184,21 @@ async function renderToolOutputs() {
 }
 
 // --- API Helpers ---
+// Bug fix: every mutating endpoint (train/start, train/stop, config/validate,
+// data/inspect, config/from-form, config/patch-training, hf/download) is
+// registered server-side with `Depends(_verify_token)` and 401s without a
+// Bearer header. This helper is the single place nearly every page routes
+// requests through, but it never attached the token that `_bootstrapAuthToken`
+// (top of this file) already captures — so Start Training / Stop Training /
+// Validate Config / Data Inspect all 401'd silently from the browser even
+// after a valid token was on `window._authToken`. Fixed once, here, instead
+// of patching each of the ~8 call sites separately.
 async function api(path, opts = {}) {
-  const resp = await fetch(API + path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (window._authToken) {
+    headers['Authorization'] = 'Bearer ' + window._authToken;
+  }
+  const resp = await fetch(API + path, { ...opts, headers });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }));
     throw new Error(err.detail || 'API error');
@@ -545,9 +557,64 @@ async function loadTrainingPage() {
     ]);
     window._recipes = recipesResp.recipes || [];
     renderTrainingPage(templatesResp.templates, statusResp);
+    initStreamingPanel();
   } catch (err) {
     document.getElementById('training-content').innerHTML =
       `<div class="empty-state"><div class="empty-state-text">Error: ${escapeHtml(err.message)}</div></div>`;
+  }
+}
+
+// --- Streaming & Quantization panel ---
+// Sets the RAM-cache slider's max from real available host RAM, and
+// applies the slider/dropdown onto the `training:` block of the currently
+// loaded config via /api/config/patch-training (server-side, re-validated
+// against the real schema — see soup_cli/ui/app.py).
+async function initStreamingPanel() {
+  try {
+    const ram = await api('/api/system/ram');
+    const slider = document.getElementById('ram-cache-slider');
+    const availEl = document.getElementById('ram-cache-avail');
+    if (ram.safe_max_gb) {
+      slider.max = ram.safe_max_gb;
+      availEl.textContent = `${ram.available_gb} GB available (safe max ${ram.safe_max_gb} GB)`;
+    } else {
+      availEl.textContent = 'psutil not installed — RAM detection unavailable';
+    }
+  } catch (err) {
+    // Non-fatal: keep the default 0-16 GB slider range.
+  }
+  onRamCacheSliderInput();
+}
+
+function onRamCacheSliderInput() {
+  const v = parseFloat(document.getElementById('ram-cache-slider').value || '0');
+  document.getElementById('ram-cache-val').textContent =
+    v > 0 ? `${v.toFixed(1)} GB` : '0 GB (disabled)';
+}
+
+async function applyStreamingSettings() {
+  const statusEl = document.getElementById('streaming-settings-status');
+  const editor = document.getElementById('config-editor');
+  if (!editor) return;
+  const ramGb = parseFloat(document.getElementById('ram-cache-slider').value || '0');
+  const quant = document.getElementById('quant-strategy-select').value;
+  statusEl.textContent = 'Applying...';
+  statusEl.style.color = 'var(--text-dim)';
+  try {
+    const result = await api('/api/config/patch-training', {
+      method: 'POST',
+      body: JSON.stringify({
+        yaml: editor.value,
+        ram_cache_gb: ramGb,
+        custom_quant_strategy: quant,
+      }),
+    });
+    editor.value = result.yaml;
+    statusEl.textContent = 'Applied to config below.';
+    statusEl.style.color = 'var(--accent)';
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+    statusEl.style.color = 'var(--danger)';
   }
 }
 
@@ -995,6 +1062,171 @@ function updateProgressBar(step, total, elapsed, eta) {
   if (stepEl) stepEl.textContent = 'Step ' + step + (total ? '/' + total : '');
   if (elapsedEl) elapsedEl.textContent = 'Elapsed: ' + formatDuration(elapsed);
   if (etaEl) etaEl.textContent = 'ETA: ' + formatDuration(eta);
+}
+
+// --- Model Hub: HuggingFace model / dataset / benchmark search + download ---
+// All search calls are read-only GETs (no auth needed, same tier as
+// /api/templates). Downloads go through the authed api() helper and land
+// under ./models/<org>__<name> or ./datasets/<org>__<name> by default (see
+// soup_cli/ui/app.py — path-validated to stay under the working directory).
+window._hubTab = 'model';
+let _hubPollHandle = null;
+
+function loadModelHubPage() {
+  switchHubTab(window._hubTab);
+  renderHubDownloads();
+  if (_hubPollHandle === null) {
+    _hubPollHandle = setInterval(renderHubDownloads, 3000);
+  }
+}
+
+function stopHubDownloadsPolling() {
+  if (_hubPollHandle !== null) {
+    clearInterval(_hubPollHandle);
+    _hubPollHandle = null;
+  }
+}
+
+function switchHubTab(tab) {
+  window._hubTab = tab;
+  document.querySelectorAll('.hub-tab').forEach(b => {
+    b.classList.toggle('active', b.dataset.hubTab === tab);
+  });
+  // Library filtering only applies to model search on the Hub API.
+  document.getElementById('hub-library-group').style.display = tab === 'model' ? '' : 'none';
+  document.getElementById('hub-task-group').querySelector('label').textContent =
+    tab === 'model' ? 'Task' : 'Task category';
+  document.getElementById('hub-task').placeholder =
+    tab === 'model' ? 'text-generation' : 'question-answering';
+}
+
+async function runHubSearch() {
+  const container = document.getElementById('hub-results');
+  container.innerHTML = '<div style="text-align:center;padding:2rem;color:var(--text-dim)">Searching...</div>';
+  const q = document.getElementById('hub-q').value.trim();
+  const task = document.getElementById('hub-task').value.trim();
+  const language = document.getElementById('hub-language').value.trim();
+  const license = document.getElementById('hub-license').value.trim();
+  const sort = document.getElementById('hub-sort').value;
+  const tab = window._hubTab;
+
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  if (task) params.set('task', task);
+  if (license) params.set('license', license);
+  params.set('sort', sort);
+  params.set('limit', '30');
+
+  let path;
+  if (tab === 'model') {
+    const library = document.getElementById('hub-library').value.trim();
+    if (library) params.set('library', library);
+    path = '/api/hf/models/search?' + params.toString();
+  } else {
+    if (language) params.set('language', language);
+    if (tab === 'benchmark') params.set('benchmark_only', 'true');
+    path = '/api/hf/datasets/search?' + params.toString();
+  }
+
+  try {
+    const resp = await api(path);
+    renderHubResults(resp.results || [], tab === 'model' ? 'model' : 'dataset');
+  } catch (err) {
+    container.innerHTML = `<div class="empty-state"><div class="empty-state-text">Error: ${escapeHtml(err.message)}</div></div>`;
+  }
+}
+
+function renderHubResults(results, repoType) {
+  const container = document.getElementById('hub-results');
+  if (results.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="empty-state-text">No results</div></div>';
+    return;
+  }
+  container.innerHTML = '<div class="grid-3" id="hub-results-grid"></div>';
+  const grid = document.getElementById('hub-results-grid');
+  results.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const title = document.createElement('div');
+    title.className = 'card-title';
+    title.textContent = item.id;
+    card.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.style.cssText = 'font-size:0.8rem;color:var(--text-dim);margin-bottom:0.5rem';
+    const bits = [`↓ ${item.downloads ?? 0}`, `♥ ${item.likes ?? 0}`];
+    if (item.pipeline_tag) bits.push(item.pipeline_tag);
+    if (item.gated) bits.push('gated');
+    meta.textContent = bits.join(' · ');
+    card.appendChild(meta);
+
+    if (item.tags && item.tags.length) {
+      const tagsWrap = document.createElement('div');
+      tagsWrap.style.cssText = 'margin-bottom:0.75rem';
+      item.tags.slice(0, 6).forEach(t => {
+        const b = document.createElement('span');
+        b.className = 'badge badge-info';
+        b.style.marginRight = '0.25rem';
+        b.textContent = t;
+        tagsWrap.appendChild(b);
+      });
+      card.appendChild(tagsWrap);
+    }
+
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-primary btn-sm';
+    btn.textContent = 'Download';
+    btn.onclick = () => downloadHubItem(item.id, repoType, btn);
+    card.appendChild(btn);
+
+    grid.appendChild(card);
+  });
+}
+
+async function downloadHubItem(repoId, repoType, btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Starting...'; }
+  try {
+    await api('/api/hf/download', {
+      method: 'POST',
+      body: JSON.stringify({ repo_id: repoId, repo_type: repoType }),
+    });
+    if (btnEl) { btnEl.textContent = 'Queued ✓'; }
+    renderHubDownloads();
+  } catch (err) {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Download'; }
+    alert('Download failed: ' + err.message);
+  }
+}
+
+async function renderHubDownloads() {
+  const container = document.getElementById('hub-downloads');
+  if (!container) return;
+  let payload;
+  try {
+    payload = await api('/api/hf/download/jobs');
+  } catch (err) {
+    return; // keep last-known state on transient errors
+  }
+  const jobs = payload.jobs || [];
+  if (jobs.length === 0) {
+    container.innerHTML = '<div class="empty-state-hint">No downloads yet.</div>';
+    return;
+  }
+  const statusBadgeMap = { queued: 'badge-info', downloading: 'badge-warning', done: 'badge-success', error: 'badge-danger' };
+  container.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Repo</th><th>Type</th><th>Status</th><th>Local dir</th></tr></thead><tbody></tbody></table></div>';
+  const tbody = container.querySelector('tbody');
+  jobs.forEach(j => {
+    const tr = document.createElement('tr');
+    const cells = [j.repo_id, j.repo_type, null, j.local_dir];
+    const tdRepo = document.createElement('td'); tdRepo.textContent = cells[0]; tr.appendChild(tdRepo);
+    const tdType = document.createElement('td'); tdType.textContent = cells[1]; tr.appendChild(tdType);
+    const tdStatus = document.createElement('td');
+    tdStatus.innerHTML = `<span class="badge ${statusBadgeMap[j.status] || 'badge-info'}">${escapeHtml(j.status)}</span>`;
+    if (j.status === 'error' && j.error) tdStatus.title = j.error;
+    tr.appendChild(tdStatus);
+    const tdDir = document.createElement('td'); tdDir.textContent = cells[3]; tr.appendChild(tdDir);
+    tbody.appendChild(tr);
+  });
 }
 
 // --- Init ---

@@ -1,0 +1,26 @@
+--- Dockerfile.ui
++++ Dockerfile.ui
+@@ -54,13 +59,17 @@ RUN pip install --no-cache-dir optimum
+ RUN CMAKE_ARGS="-DGGML_CUDA=on -DCUDA_DOCKER_ARCH=all" \
+     pip install --no-cache-dir llama-cpp-python --no-build-isolation
+ 
+-# Gradio and web dependencies
+-RUN pip install --no-cache-dir \
+-    "gradio>=5.0.0" \
+-    "fastapi" \
+-    "uvicorn[standard]" \
+-    "psutil"
++# psutil for RAM-aware layer streaming / RAM-cache sizing (utils/layer_stream.py,
++# memory/layer_cache.py). fastapi/uvicorn/gradio dropped: they duplicated the
++# `ui` extra above, and gradio was never used by anything soup_cli actually
++# imports — see soup_cli/ui/app.py (the real, FastAPI-based dashboard).
++RUN pip install --no-cache-dir "psutil>=5.9.0"
+ 
+ EXPOSE 7860
+ 
+-ENTRYPOINT ["python", "-m", "soup_cli.ui.app"]+# Bug fix: `python -m soup_cli.ui.app` never started a server — that module
++# has no `__main__` guard (uvicorn.run lives in `soup_cli/commands/ui.py`,
++# behind the real `soup ui` CLI command, which also generates+prints the
++# Bearer auth token every mutating endpoint requires). The old entrypoint
++# just imported the module and exited.
++ENTRYPOINT ["soup", "ui", "--host", "0.0.0.0", "--port", "7860", "--no-browser"]

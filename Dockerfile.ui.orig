@@ -25,12 +25,7 @@ WORKDIR /workspace
 COPY . /workspace
 
 # Install Soup from your local fork
-# Bug fix: was missing the `ui` extra (fastapi/uvicorn) from pyproject.toml's
-# own [project.optional-dependencies] and separately hand-installing gradio +
-# raw fastapi/uvicorn/psutil below instead — pulling in an entirely different,
-# disconnected web framework nothing in this image actually serves. Use the
-# extra pyproject.toml already declares for this.
-RUN pip install --no-cache-dir -e ".[train,serve,data,eval,ui]"
+RUN pip install --no-cache-dir -e ".[train,serve,data,eval]"
 
 # Install core web dependencies
 RUN pip install --no-cache-dir \

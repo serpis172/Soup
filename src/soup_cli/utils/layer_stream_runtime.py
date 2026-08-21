@@ -1621,7 +1621,7 @@ def install_streaming(
             validate_quant_shape(ckpt, spec_q, shard_spec)
     spec = needed
 
-source, pinned = _build_source(shard_dir, n_layers, spec, pin, console, tier, ram_cache)
+    source, pinned = _build_source(shard_dir, n_layers, spec, pin, console, tier, ram_cache)
     pool = LayerBufferPool(spec, n_buffers=buffers, device=device)
     stream = torch.cuda.Stream() if str(device).startswith("cuda") else None
     prefetcher = StreamPrefetcher(pool, source, n_layers, stream)

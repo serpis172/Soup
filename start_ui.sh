@@ -19,7 +19,7 @@ echo "🔨 Costruzione immagine Docker (può richiedere 10-20 minuti)..."
 echo "Questo installerà e compilerà le dipendenze CUDA..."
 
 # Build con output verbose per vedere dove fallisce se c'è un errore
-if ! docker build -f Dockerfile.ui -t "$IMAGE_NAME" .; then
+if ! docker build --progress=plain -f Dockerfile.ui -t "$IMAGE_NAME" .; then
     echo ""
     echo "❌ Build fallita! Possibili soluzioni:"
     echo "   1. Assicurati di avere abbastanza spazio su disco (almeno 20GB)"
@@ -36,6 +36,9 @@ fi
 
 echo "🚀 Avvio Soup WebUI..."
 echo "Apri nel browser: http://localhost:7860"
+echo "ℹ️  Il token Bearer richiesto per Avviare/Fermare training e scaricare modelli"
+echo "   viene stampato qui sotto all'avvio (pannello 'soup ui') — copialo se il"
+echo "   browser non lo raccoglie automaticamente dall'URL."
 
 docker run -it --rm \
     --name "$CONTAINER_NAME" \
@@ -44,4 +47,6 @@ docker run -it --rm \
     -p 7860:7860 \
     -v "$(pwd)/data:/workspace/data" \
     -v "$(pwd)/output:/workspace/output" \
+    -v "$(pwd)/models:/workspace/models" \
+    -v "$(pwd)/datasets:/workspace/datasets" \
     "$IMAGE_NAME"

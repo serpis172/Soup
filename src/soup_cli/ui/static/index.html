@@ -33,6 +33,10 @@
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
           <span>Tool Outputs</span>
         </button>
+        <button class="nav-item" data-page="modelhub" onclick="navigate('modelhub')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <span>Model Hub</span>
+        </button>
       </nav>
       <div class="sidebar-footer" id="sidebar-version">Soup Web UI</div>
     </aside>
@@ -59,6 +63,41 @@
         </div>
         <div id="training-content">
           <div style="text-align:center;padding:3rem;color:var(--text-dim)">Loading...</div>
+        </div>
+        <!-- Streaming & Quantization -->
+        <div class="card">
+          <div class="card-title">Streaming &amp; Quantization</div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label class="form-label">
+                Layer RAM cache: <span id="ram-cache-val">0 GB (disabled)</span>
+                — <span id="ram-cache-avail" style="color:var(--text-dim)"></span>
+              </label>
+              <input type="range" id="ram-cache-slider" min="0" max="16" step="0.5" value="0"
+                     oninput="onRamCacheSliderInput()">
+              <div class="empty-state-hint" style="margin-top:0.35rem">
+                Keeps a bounded, most-recently-used subset of decoder layers resident in
+                pinned host RAM instead of the full model, for streamed checkpoints too
+                large to fully fit. 0 = disabled (plain disk/RAM tier).
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Post-training quantization</label>
+              <select id="quant-strategy-select">
+                <option value="none">None</option>
+                <option value="awq">AWQ (4-bit)</option>
+                <option value="gptq">GPTQ (4-bit)</option>
+                <option value="k-quants">GGUF k-quants (Q4_K_M)</option>
+                <option value="i-quants">GGUF i-quants (IQ4_XS)</option>
+              </select>
+              <div class="empty-state-hint" style="margin-top:0.35rem">
+                Applied automatically after training via <code>soup export</code> — the
+                trainer prints the exact command once the checkpoint is ready.
+              </div>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="applyStreamingSettings()">Apply to config</button>
+          <span id="streaming-settings-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
         </div>
         <!-- Training Progress Bar -->
         <div id="train-progress" class="card" style="display:none">
@@ -185,6 +224,65 @@
               <div class="empty-state-text">Waiting for tool calls...</div>
               <div class="empty-state-hint">POST to /v1/tools/python or run a tool-calling SFT to populate</div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Model Hub Page — HF model/dataset/benchmark search + download -->
+      <div id="page-modelhub" class="page">
+        <div class="page-header">
+          <h1 class="page-title">Model Hub</h1>
+        </div>
+        <div class="card">
+          <div style="display:flex;gap:0.5rem;margin-bottom:1rem">
+            <button class="btn btn-sm hub-tab active" data-hub-tab="model" onclick="switchHubTab('model')">Models</button>
+            <button class="btn btn-sm hub-tab" data-hub-tab="dataset" onclick="switchHubTab('dataset')">Datasets</button>
+            <button class="btn btn-sm hub-tab" data-hub-tab="benchmark" onclick="switchHubTab('benchmark')">Benchmarks</button>
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Search</label>
+              <input type="text" id="hub-q" placeholder="e.g. llama, qwen, mmlu..." onkeydown="if(event.key==='Enter')runHubSearch()">
+            </div>
+            <div class="form-group" id="hub-task-group">
+              <label class="form-label">Task</label>
+              <input type="text" id="hub-task" placeholder="text-generation">
+            </div>
+            <div class="form-group" id="hub-library-group">
+              <label class="form-label">Library</label>
+              <input type="text" id="hub-library" placeholder="transformers, peft, gguf...">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Language</label>
+              <input type="text" id="hub-language" placeholder="en">
+            </div>
+            <div class="form-group">
+              <label class="form-label">License</label>
+              <input type="text" id="hub-license" placeholder="apache-2.0">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Sort by</label>
+              <select id="hub-sort">
+                <option value="downloads">Downloads</option>
+                <option value="likes">Likes</option>
+                <option value="trending_score">Trending</option>
+                <option value="last_modified">Recently updated</option>
+                <option value="created_at">Newest</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn btn-primary" onclick="runHubSearch()">Search</button>
+        </div>
+        <div id="hub-results">
+          <div class="empty-state">
+            <div class="empty-state-text">Search Hugging Face Hub to get started</div>
+            <div class="empty-state-hint">Results use the Hub's own filters — task, library, language, license</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Downloads</div>
+          <div id="hub-downloads">
+            <div class="empty-state-hint">No downloads yet.</div>
           </div>
         </div>
       </div>

@@ -937,31 +937,53 @@ class SFTTrainerWrapper(StreamingSetupMixin):
         self.model = AutoModelForCausalLM.from_pretrained(cfg.base, **model_kwargs)
         from soup_cli.utils.data_pipeline import apply_vocab_expansion
 
-
         apply_vocab_expansion(
-        self.tokenizer,
-        self.model,
-        cfg.data,
+            self.tokenizer,
+            self.model,
+            cfg.data,
         )
-        
-        # --- AGGIUNGI QUI: Dispatch Quantizzazione Custom ---
-        if tcfg.custom_quant_strategy != "none":
-            from soup_cli.quantization.strategies import apply_custom_quantization
-            console.print(f"[cyan]Applicazione quantizzazione custom: {tcfg.custom_quant_strategy}[/]")
-            
-            # Se QAT, deve essere applicato prima del training (modificando i layer)
-            if tcfg.custom_quant_strategy == "qat":
-                apply_custom_quantization(self.model, "qat", self.output_dir)
-            
-            # Se AWQ/GPTQ, di solito si quantizza il modello base prima di addestrare LoRA,
-            # oppure si esportano gli adapter alla fine. Qui prepariamo il modello.
-            elif tcfg.custom_quant_strategy in ["awq", "gptq"]:
-                # Logica per preparare il modello alla quantizzazione post-training
-                pass # Implementazione specifica per il formato scelto
-                
-            elif tcfg.custom_quant_strategy in ["k-quants", "i-quants"]:
-                console.print("[cyan]I k/i-quants verranno generati in fase di export (GGUF).[/]")
-                
+
+        # training.custom_quant_strategy: AWQ/GPTQ/k-quants/i-quants are
+        # POST-training export formats — they need the *trained* (and, for
+        # a LoRA run, adapter-merged) checkpoint as input, not the freshly
+        # loaded base model. Running them here, before a single training
+        # step, would either no-op or corrupt the base weights this run is
+        # about to train on. The real, working implementation for all four
+        # already exists in `soup export` (`commands/export.py`); this just
+        # remembers the choice and prints the exact follow-up command once
+        # training finishes, instead of pretending to quantize now.
+        #
+        # QAT is the one strategy that legitimately belongs at model-load
+        # time (it has to be in the graph *during* training), but a generic
+        # `torch.ao.quantization` qconfig slapped on an arbitrary causal LM
+        # is not a safe default. `soup` already has a real, gated QAT-style
+        # path for LLMs — BitNet 1.58-bit training — so we point there
+        # instead of half-applying an untested quantization hook.
+        if tcfg.custom_quant_strategy == "qat":
+            console.print(
+                "[yellow]training.custom_quant_strategy=qat is not applied by the "
+                "SFT trainer.[/] For quantization-aware fine-tuning, use the BitNet "
+                "trainer instead: [bold]soup train --trainer bitnet --config ...[/]"
+            )
+        elif tcfg.custom_quant_strategy != "none":
+            self._pending_export_quant = tcfg.custom_quant_strategy
+            _export_cmd = {
+                "awq": f"soup export --model {self.output_dir} --format awq --bits 4",
+                "gptq": f"soup export --model {self.output_dir} --format gptq --bits 4",
+                "k-quants": f"soup export --model {self.output_dir} --format gguf --quant q4_k_m",
+                "i-quants": (
+                    f"soup export --model {self.output_dir} --format gguf-ud "
+                    "--gguf-flavour IQ4_XS"
+                ),
+            }[tcfg.custom_quant_strategy]
+            console.print(
+                f"[cyan]training.custom_quant_strategy={tcfg.custom_quant_strategy}[/] "
+                "noted — this trains a normal full-precision/LoRA checkpoint first "
+                "(AWQ/GPTQ/GGUF need the *trained* weights as input, not the base "
+                f"model). Once training finishes, quantize the result with:\n"
+                f"  [bold]{_export_cmd}[/]"
+            )
+
         # Long-context — apply RoPE scaling after model load
         if tcfg.rope_scaling_type:
             from soup_cli.utils.long_context import apply_long_context_config
