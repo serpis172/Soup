@@ -239,6 +239,37 @@ def is_advanced_gguf_format(value: object) -> bool:
     )
 
 
+# --- Standard (non-"advanced") llama.cpp k-quants ---------------------------
+# These are the plain `--quant <TYPE>` values `soup export --format gguf`
+# hands straight to llama-quantize (see commands/export.py::_run_quantize),
+# as opposed to the UD/IQ/Apple-ARM ladder above which goes through the
+# imatrix-calibrated `--format gguf-ud` path. Single source of truth for
+# both the config validator (config/schema.py) and the Web UI's quant
+# dropdown (ui/app.py) — approximate bit-widths are documented llama.cpp
+# behaviour, not measured here.
+STANDARD_GGUF_QUANT_TYPES: Mapping[str, GGUFQuantSpec] = MappingProxyType({
+    "Q2_K":    _spec("Q2_K",    "k-quant", 2.5, "Smallest k-quant, noticeable quality loss"),
+    "Q3_K_S":  _spec("Q3_K_S",  "k-quant", 3.0, "Q3_K, small variant"),
+    "Q3_K_M":  _spec("Q3_K_M",  "k-quant", 3.5, "Q3_K, medium variant"),
+    "Q3_K_L":  _spec("Q3_K_L",  "k-quant", 3.5, "Q3_K, large variant"),
+    "Q4_0":    _spec("Q4_0",    "legacy",  4.0, "Legacy 4-bit (no k-quant blocks)"),
+    "Q4_K_S":  _spec("Q4_K_S",  "k-quant", 4.0, "Q4_K, small variant"),
+    "Q4_K_M":  _spec("Q4_K_M",  "k-quant", 4.5, "Q4_K, medium variant — common default"),
+    "Q5_0":    _spec("Q5_0",    "legacy",  5.0, "Legacy 5-bit (no k-quant blocks)"),
+    "Q5_K_S":  _spec("Q5_K_S",  "k-quant", 5.0, "Q5_K, small variant"),
+    "Q5_K_M":  _spec("Q5_K_M",  "k-quant", 5.5, "Q5_K, medium variant"),
+    "Q6_K":    _spec("Q6_K",    "k-quant", 6.5, "Near-lossless for most models"),
+    "Q8_0":    _spec("Q8_0",    "legacy",  8.0, "Essentially lossless, 2x smaller than F16"),
+})
+
+
+def is_standard_gguf_quant_type(value: object) -> bool:
+    """Return True iff ``value`` is a plain llama-quantize `--quant` type."""
+    if isinstance(value, bool) or not isinstance(value, str):
+        return False
+    return value.upper() in STANDARD_GGUF_QUANT_TYPES
+
+
 def get_gguf_spec(name: str) -> GGUFQuantSpec:
     """Return the frozen :class:`GGUFQuantSpec` for ``name`` (case-insensitive)."""
     if isinstance(name, bool) or not isinstance(name, str):

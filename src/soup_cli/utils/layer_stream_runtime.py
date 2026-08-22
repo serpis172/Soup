@@ -330,6 +330,11 @@ class RamSource:
             # Con cache esterna: non caricare tutto subito.
             # I layer verranno caricati quando richiesti da get_layer().
             self.store = [None] * n_layers
+            if hasattr(self.ram_cache, "set_bounds"):
+                # Gives the read-ahead prefetcher its walk boundary so it
+                # can stop cleanly at the edges instead of learning them
+                # the hard way from a failed load.
+                self.ram_cache.set_bounds(n_layers)
 
     def _load_layer(self, idx: int) -> Tuple[Dict[str, Any], int]:
         """Carica un singolo layer dallo shard e ritorna (dict_tensori, byte)."""

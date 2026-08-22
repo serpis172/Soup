@@ -61,6 +61,7 @@ from soup_cli.commands import monitor as monitor_cmd  # noqa: E402
 from soup_cli.commands import quantize as quantize_cmd  # noqa: E402
 from soup_cli.commands import quickstart as quickstart_cmd  # noqa: E402
 from soup_cli.commands import spectrum as spectrum_cmd  # noqa: E402
+from soup_cli.commands import compress as compress_cmd  # noqa: E402
 from soup_cli.commands import (  # noqa: E402
     tui as tui_cmd,
 )
@@ -144,6 +145,10 @@ app.command(name="tui")(tui_cmd.tui)
 app.add_typer(
     spectrum_cmd.app, name="spectrum",
     help="Spectrum SNR scan for targeted training (v0.71.23).",
+)
+app.add_typer(
+    compress_cmd.app, name="compress",
+    help="Optional model-density tools: neuron importance + similar-neuron merging (v0.73.6).",
 )
 app.add_typer(
     can.app, name="can",

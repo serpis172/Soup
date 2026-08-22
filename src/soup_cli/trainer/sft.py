@@ -967,15 +967,21 @@ class SFTTrainerWrapper(StreamingSetupMixin):
             )
         elif tcfg.custom_quant_strategy != "none":
             self._pending_export_quant = tcfg.custom_quant_strategy
-            _export_cmd = {
-                "awq": f"soup export --model {self.output_dir} --format awq --bits 4",
-                "gptq": f"soup export --model {self.output_dir} --format gptq --bits 4",
-                "k-quants": f"soup export --model {self.output_dir} --format gguf --quant q4_k_m",
-                "i-quants": (
+            detail = tcfg.custom_quant_detail  # already validated against the
+            # chosen strategy's real value domain in config/schema.py
+            strategy = tcfg.custom_quant_strategy
+            if strategy in ("awq", "gptq"):
+                bits = detail or "4"
+                _export_cmd = f"soup export --model {self.output_dir} --format {strategy} --bits {bits}"
+            elif strategy == "k-quants":
+                quant_type = (detail or "Q4_K_M").lower()
+                _export_cmd = f"soup export --model {self.output_dir} --format gguf --quant {quant_type}"
+            else:  # i-quants
+                flavour = detail or "IQ4_XS"
+                _export_cmd = (
                     f"soup export --model {self.output_dir} --format gguf-ud "
-                    "--gguf-flavour IQ4_XS"
-                ),
-            }[tcfg.custom_quant_strategy]
+                    f"--gguf-flavour {flavour}"
+                )
             console.print(
                 f"[cyan]training.custom_quant_strategy={tcfg.custom_quant_strategy}[/] "
                 "noted — this trains a normal full-precision/LoRA checkpoint first "

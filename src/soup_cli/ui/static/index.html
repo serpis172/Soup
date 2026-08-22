@@ -37,6 +37,10 @@
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <span>Model Hub</span>
         </button>
+        <button class="nav-item" data-page="compress" onclick="navigate('compress')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+          <span>Compress</span>
+        </button>
       </nav>
       <div class="sidebar-footer" id="sidebar-version">Soup Web UI</div>
     </aside>
@@ -70,26 +74,30 @@
           <div class="grid-2">
             <div class="form-group">
               <label class="form-label">
-                Layer RAM cache: <span id="ram-cache-val">0 GB (disabled)</span>
+                Layer RAM prefetch: <span id="ram-cache-val">0 GB (disabled)</span>
                 — <span id="ram-cache-avail" style="color:var(--text-dim)"></span>
               </label>
               <input type="range" id="ram-cache-slider" min="0" max="16" step="0.5" value="0"
                      oninput="onRamCacheSliderInput()">
               <div class="empty-state-hint" style="margin-top:0.35rem">
-                Keeps a bounded, most-recently-used subset of decoder layers resident in
-                pinned host RAM instead of the full model, for streamed checkpoints too
-                large to fully fit. 0 = disabled (plain disk/RAM tier).
+                A background thread reads upcoming decoder layers ahead of need into
+                pinned host RAM, for streamed checkpoints too large to fully fit.
+                0 = disabled (plain disk/RAM tier).
               </div>
             </div>
             <div class="form-group">
               <label class="form-label">Post-training quantization</label>
-              <select id="quant-strategy-select">
+              <select id="quant-strategy-select" onchange="onQuantStrategyChange()">
                 <option value="none">None</option>
-                <option value="awq">AWQ (4-bit)</option>
-                <option value="gptq">GPTQ (4-bit)</option>
-                <option value="k-quants">GGUF k-quants (Q4_K_M)</option>
-                <option value="i-quants">GGUF i-quants (IQ4_XS)</option>
+                <option value="awq">AWQ</option>
+                <option value="gptq">GPTQ</option>
+                <option value="k-quants">GGUF k-quants</option>
+                <option value="i-quants">GGUF i-quants / UD (imatrix)</option>
               </select>
+              <div id="quant-detail-group" style="margin-top:0.5rem;display:none">
+                <label class="form-label" id="quant-detail-label">Bits</label>
+                <select id="quant-detail-select"></select>
+              </div>
               <div class="empty-state-hint" style="margin-top:0.35rem">
                 Applied automatically after training via <code>soup export</code> — the
                 trainer prints the exact command once the checkpoint is ready.
@@ -283,6 +291,86 @@
           <div class="card-title">Downloads</div>
           <div id="hub-downloads">
             <div class="empty-state-hint">No downloads yet.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Compress Page — optional neuron importance + similar-neuron merging -->
+      <div id="page-compress" class="page">
+        <div class="page-header">
+          <h1 class="page-title">Compress</h1>
+        </div>
+        <div class="card">
+          <div class="empty-state-hint" style="margin-bottom:0.75rem">
+            Optional, opt-in model-density tools. Nothing here runs automatically and
+            nothing modifies a checkpoint unless you press Apply. MLP/FFN neurons only —
+            see <code>soup compress --help</code> for the CLI equivalent and full docs.
+          </div>
+          <div class="form-group">
+            <label class="form-label">Model</label>
+            <input type="text" id="compress-model" placeholder="HF Hub id or local model directory">
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Neuron importance (weight-magnitude ranking)</div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label class="form-label">Modules</label>
+              <select id="importance-modules">
+                <option value="mlp,attn">mlp, attn</option>
+                <option value="mlp">mlp only</option>
+                <option value="attn">attn only</option>
+                <option value="all">all</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Bottom-K per layer</label>
+              <input type="number" id="importance-bottomk" value="10" min="1" max="200">
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runImportanceScan()">Scan importance</button>
+          <span id="importance-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="importance-results" style="margin-top:1rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Similar-neuron merging (MLP intermediate dim)</div>
+          <div class="empty-state-hint" style="margin-bottom:0.5rem">
+            Two neurons merge only when both their gate_proj and up_proj rows are highly
+            similar — safe without calibration data because that jointly implies near-identical
+            activations for any input. Measured on synthetic weights: ~0.3% median output error
+            at 0.998 similarity, ~1.3% at 0.97. Default 0.98 is conservative.
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Threshold: <span id="merge-threshold-val">0.98</span></label>
+              <input type="range" id="merge-threshold" min="0.80" max="0.999" step="0.001" value="0.98"
+                     oninput="document.getElementById('merge-threshold-val').textContent=this.value">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Max pairs / layer</label>
+              <input type="number" id="merge-maxpairs" value="50" min="1" max="1000">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Output directory (for Apply)</label>
+              <input type="text" id="merge-outputdir" placeholder="e.g. ./output/merged-model">
+            </div>
+          </div>
+          <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:var(--text-dim);margin-bottom:0.75rem">
+            <input type="checkbox" id="merge-allow-nonuniform">
+            Allow non-uniform intermediate_size (writes a checkpoint stock <code>transformers</code> can't load — advanced/custom deployments only)
+          </label>
+          <button class="btn btn-primary btn-sm" onclick="runNeuronScan()">Find candidates</button>
+          <button class="btn btn-danger btn-sm" onclick="runNeuronApply()">Apply merge</button>
+          <span id="merge-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="merge-results" style="margin-top:1rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Compress jobs</div>
+          <div id="compress-jobs">
+            <div class="empty-state-hint">No jobs yet.</div>
           </div>
         </div>
       </div>

@@ -333,18 +333,21 @@ class StreamingSetupMixin:
             ),
         )
         if tcfg.ram_cache_gb > 0 and tcfg.stream_source in ("ram", "auto"):
-            from soup_cli.memory.layer_cache import RamLayerCache
+            from soup_cli.memory.layer_cache import LayerPrefetcher
 
-            # RamLayerCache clamps the request to a safe fraction of
+            # LayerPrefetcher clamps the request to a safe fraction of
             # *available* system RAM internally and reports via `notify`
             # if it had to reduce it — surfaced here instead of trusting
             # the raw config value, since a UI slider can ask for more
-            # than the box has.
-            self._ram_layer_cache = RamLayerCache(
+            # than the box has. It's a pure read-ahead window (one
+            # background thread, no eviction bookkeeping) — see
+            # memory/layer_cache.py for why that's enough for this access
+            # pattern.
+            self._ram_layer_cache = LayerPrefetcher(
                 max_ram_gb=tcfg.ram_cache_gb, notify=console.print
             )
-            used_gb = self._ram_layer_cache.max_ram_bytes / (1024**3)
-            console.print(f"[green]Layer RAM cache active: {used_gb:.1f} GB[/]")
+            used_gb = self._ram_layer_cache.max_bytes / (1024**3)
+            console.print(f"[green]Layer RAM prefetch active: {used_gb:.1f} GB read-ahead[/]")
         else:
             self._ram_layer_cache = None
         # v0.72.3 — the disk overflow tier is live, so a base that does not fit

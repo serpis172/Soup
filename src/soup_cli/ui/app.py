@@ -879,6 +879,7 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         yaml: str
         ram_cache_gb: Optional[float] = Field(default=None, ge=0.0)
         custom_quant_strategy: Optional[str] = None
+        custom_quant_detail: Optional[str] = None
 
     @app.post("/api/config/patch-training", dependencies=[Depends(_verify_token)])
     def patch_training_config(req: TrainingPatchRequest):
@@ -908,6 +909,11 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             training["ram_cache_gb"] = req.ram_cache_gb
         if req.custom_quant_strategy is not None:
             training["custom_quant_strategy"] = req.custom_quant_strategy
+        if req.custom_quant_detail is not None:
+            if req.custom_quant_detail == "":
+                training.pop("custom_quant_detail", None)
+            else:
+                training["custom_quant_detail"] = req.custom_quant_detail
         doc["training"] = training
 
         try:
@@ -1087,5 +1093,200 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
     def hf_download_jobs():
         with _hf_jobs_lock:
             return {"jobs": sorted(_hf_jobs.values(), key=lambda j: j["started_ts"], reverse=True)}
+
+    # --- Quantization format catalog (real registry, not hardcoded in JS) ---
+
+    @app.get("/api/quant/formats")
+    def quant_formats():
+        """Real quantization choices per strategy, sourced from
+        utils/gguf_quant.py's registry — the same one config/schema.py
+        validates training.custom_quant_detail against — so the UI can
+        never offer a value the backend would then reject.
+        """
+        from soup_cli.utils.gguf_quant import STANDARD_GGUF_QUANT_TYPES, _GGUF_METADATA
+
+        return {
+            "awq": {"kind": "bits", "options": [4, 8]},
+            "gptq": {"kind": "bits", "options": [4, 8]},
+            "k-quants": {
+                "kind": "named",
+                "options": [
+                    {"name": s.name, "bits": s.bits, "description": s.description}
+                    for s in sorted(STANDARD_GGUF_QUANT_TYPES.values(), key=lambda s: s.bits)
+                ],
+            },
+            "i-quants": {
+                "kind": "named",
+                "options": [
+                    {"name": s.name, "bits": s.bits, "description": s.description}
+                    for s in sorted(_GGUF_METADATA.values(), key=lambda s: s.bits)
+                ],
+            },
+        }
+
+    # --- Model density tools: importance ranking + neuron merging ---
+    # Same background-job pattern as HF downloads above (scanning/merging a
+    # real model's weights can take real time — never block the request).
+
+    _compress_jobs: Dict[str, Dict[str, Any]] = {}
+    _compress_jobs_lock = threading.Lock()
+
+    def _new_compress_job(kind: str, extra: dict) -> str:
+        job_id = secrets.token_urlsafe(8)
+        with _compress_jobs_lock:
+            _compress_jobs[job_id] = {
+                "job_id": job_id,
+                "kind": kind,
+                "status": "running",
+                "error": None,
+                "result": None,
+                "started_ts": time.time(),
+                "finished_ts": None,
+                **extra,
+            }
+        return job_id
+
+    def _finish_compress_job(job_id: str, *, result=None, error=None) -> None:
+        with _compress_jobs_lock:
+            job = _compress_jobs[job_id]
+            job["status"] = "error" if error else "done"
+            job["error"] = error
+            job["result"] = result
+            job["finished_ts"] = time.time()
+
+    class ImportanceScanRequest(PydanticBaseModel):
+        model: str
+        modules: str = "mlp,attn"
+        bottom_k: int = Field(default=10, ge=1, le=200)
+
+    def _run_importance_scan(job_id: str, req: "ImportanceScanRequest"):
+        try:
+            from soup_cli.utils.neuron_compress import rank_importance
+            from soup_cli.utils.spectrum_scan import resolve_model_weights
+
+            weights_dir = resolve_model_weights(req.model)
+            results = rank_importance(weights_dir, modules=req.modules)
+            payload = [
+                {
+                    "param_name": r.param_name,
+                    "group": r.group,
+                    "module_type": r.module_type,
+                    "n_neurons": r.n_neurons,
+                    "least_important": [
+                        {"index": i, "norm": v} for i, v in r.least_important(req.bottom_k)
+                    ],
+                }
+                for r in results
+            ]
+            _finish_compress_job(job_id, result={"layers": payload})
+        except Exception as exc:  # background thread — never let this die silently
+            _finish_compress_job(job_id, error=f"{type(exc).__name__}: {exc}")
+
+    @app.post("/api/compress/importance/scan", dependencies=[Depends(_verify_token)])
+    def compress_importance_scan(req: ImportanceScanRequest):
+        job_id = _new_compress_job("importance", {"model": req.model})
+        threading.Thread(target=_run_importance_scan, args=(job_id, req), daemon=True).start()
+        return {"job_id": job_id}
+
+    class NeuronScanRequest(PydanticBaseModel):
+        model: str
+        threshold: float = Field(default=0.98, ge=0.0, le=1.0)
+        max_pairs_per_layer: int = Field(default=50, ge=1, le=1000)
+
+    def _run_neuron_scan(job_id: str, req: "NeuronScanRequest"):
+        try:
+            from soup_cli.utils.neuron_compress import find_merge_candidates
+            from soup_cli.utils.spectrum_scan import resolve_model_weights
+
+            weights_dir = resolve_model_weights(req.model)
+            candidates = find_merge_candidates(
+                weights_dir, threshold=req.threshold, max_pairs_per_layer=req.max_pairs_per_layer
+            )
+            payload = {
+                str(layer_idx): [
+                    {"i": c.i, "j": c.j, "joint_similarity": c.joint_similarity}
+                    for c in cands
+                ]
+                for layer_idx, cands in candidates.items()
+            }
+            total_pairs = sum(len(v) for v in payload.values())
+            _finish_compress_job(
+                job_id,
+                result={
+                    "candidates": payload,
+                    "total_pairs": total_pairs,
+                    "layers_with_candidates": len(payload),
+                },
+            )
+        except Exception as exc:
+            _finish_compress_job(job_id, error=f"{type(exc).__name__}: {exc}")
+
+    @app.post("/api/compress/neurons/scan", dependencies=[Depends(_verify_token)])
+    def compress_neurons_scan(req: NeuronScanRequest):
+        job_id = _new_compress_job(
+            "neurons_scan", {"model": req.model, "threshold": req.threshold}
+        )
+        threading.Thread(target=_run_neuron_scan, args=(job_id, req), daemon=True).start()
+        return {"job_id": job_id}
+
+    class NeuronApplyRequest(PydanticBaseModel):
+        model: str
+        threshold: float = Field(default=0.98, ge=0.0, le=1.0)
+        max_pairs_per_layer: int = Field(default=50, ge=1, le=1000)
+        output_dir: str
+        allow_nonuniform: bool = False
+
+    def _run_neuron_apply(job_id: str, req: "NeuronApplyRequest", target_dir: str):
+        try:
+            from soup_cli.utils.neuron_compress import (
+                apply_merges_to_checkpoint,
+                find_merge_candidates,
+            )
+            from soup_cli.utils.spectrum_scan import resolve_model_weights
+
+            weights_dir = resolve_model_weights(req.model)
+            candidates = find_merge_candidates(
+                weights_dir, threshold=req.threshold, max_pairs_per_layer=req.max_pairs_per_layer
+            )
+            summary = apply_merges_to_checkpoint(
+                weights_dir, target_dir, candidates, allow_nonuniform=req.allow_nonuniform
+            )
+            _finish_compress_job(
+                job_id,
+                result={
+                    "output_dir": target_dir,
+                    "layers": [
+                        {"layer_idx": idx, "before": before, "after": after}
+                        for idx, before, after in summary
+                    ],
+                },
+            )
+        except Exception as exc:
+            _finish_compress_job(job_id, error=f"{type(exc).__name__}: {exc}")
+
+    @app.post("/api/compress/neurons/apply", dependencies=[Depends(_verify_token)])
+    def compress_neurons_apply(req: NeuronApplyRequest):
+        from soup_cli.utils.paths import is_under_cwd
+
+        if not is_under_cwd(req.output_dir):
+            raise HTTPException(
+                status_code=403, detail="output_dir must stay inside the working directory"
+            )
+        job_id = _new_compress_job(
+            "neurons_apply", {"model": req.model, "output_dir": req.output_dir}
+        )
+        threading.Thread(
+            target=_run_neuron_apply, args=(job_id, req, req.output_dir), daemon=True
+        ).start()
+        return {"job_id": job_id}
+
+    @app.get("/api/compress/jobs")
+    def compress_jobs():
+        with _compress_jobs_lock:
+            return {
+                "jobs": sorted(
+                    _compress_jobs.values(), key=lambda j: j["started_ts"], reverse=True
+                )
+            }
 
     return app

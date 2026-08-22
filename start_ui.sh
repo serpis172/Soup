@@ -19,7 +19,7 @@ echo "🔨 Costruzione immagine Docker (può richiedere 10-20 minuti)..."
 echo "Questo installerà e compilerà le dipendenze CUDA..."
 
 # Build con output verbose per vedere dove fallisce se c'è un errore
-if ! docker build --progress=plain -f Dockerfile.ui -t "$IMAGE_NAME" .; then
+if ! docker build -f Dockerfile.ui -t "$IMAGE_NAME" .; then
     echo ""
     echo "❌ Build fallita! Possibili soluzioni:"
     echo "   1. Assicurati di avere abbastanza spazio su disco (almeno 20GB)"

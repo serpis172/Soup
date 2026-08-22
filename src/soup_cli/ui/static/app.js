@@ -95,10 +95,12 @@ function navigate(page) {
   else if (page === 'chat') loadChatPage();
   else if (page === 'tools') loadToolOutputs();
   else if (page === 'modelhub') loadModelHubPage();
+  else if (page === 'compress') loadCompressPage();
   // v0.53.10 #155 — pause Tool Outputs polling when navigating away so we
   // don't keep firing fetch() against /api/tool-outputs from background tabs.
   if (page !== 'tools') stopToolOutputsPolling();
   if (page !== 'modelhub') stopHubDownloadsPolling();
+  if (page !== 'compress') stopCompressJobsPolling();
 }
 
 // --- Tool Outputs panel (v0.53.10 #155) ---
@@ -584,6 +586,47 @@ async function initStreamingPanel() {
     // Non-fatal: keep the default 0-16 GB slider range.
   }
   onRamCacheSliderInput();
+
+  try {
+    window._quantFormats = await api('/api/quant/formats');
+  } catch (err) {
+    window._quantFormats = null;
+  }
+  onQuantStrategyChange();
+}
+
+function onQuantStrategyChange() {
+  const strategy = document.getElementById('quant-strategy-select').value;
+  const group = document.getElementById('quant-detail-group');
+  const label = document.getElementById('quant-detail-label');
+  const select = document.getElementById('quant-detail-select');
+  select.innerHTML = '';
+
+  if (strategy === 'none' || !window._quantFormats || !window._quantFormats[strategy]) {
+    group.style.display = 'none';
+    return;
+  }
+  group.style.display = '';
+  const spec = window._quantFormats[strategy];
+  if (spec.kind === 'bits') {
+    label.textContent = 'Bits';
+    spec.options.forEach(bits => {
+      const opt = document.createElement('option');
+      opt.value = String(bits);
+      opt.textContent = `${bits}-bit`;
+      select.appendChild(opt);
+    });
+    // 4-bit is the common default across AWQ/GPTQ.
+    select.value = spec.options.includes(4) ? '4' : String(spec.options[0]);
+  } else {
+    label.textContent = 'Quant type';
+    spec.options.forEach(o => {
+      const opt = document.createElement('option');
+      opt.value = o.name;
+      opt.textContent = `${o.name} (~${o.bits}-bit) — ${o.description}`;
+      select.appendChild(opt);
+    });
+  }
 }
 
 function onRamCacheSliderInput() {
@@ -598,6 +641,8 @@ async function applyStreamingSettings() {
   if (!editor) return;
   const ramGb = parseFloat(document.getElementById('ram-cache-slider').value || '0');
   const quant = document.getElementById('quant-strategy-select').value;
+  const detailSelect = document.getElementById('quant-detail-select');
+  const detail = (quant !== 'none' && detailSelect.options.length) ? detailSelect.value : '';
   statusEl.textContent = 'Applying...';
   statusEl.style.color = 'var(--text-dim)';
   try {
@@ -607,6 +652,7 @@ async function applyStreamingSettings() {
         yaml: editor.value,
         ram_cache_gb: ramGb,
         custom_quant_strategy: quant,
+        custom_quant_detail: detail,
       }),
     });
     editor.value = result.yaml;
@@ -1227,6 +1273,211 @@ async function renderHubDownloads() {
     const tdDir = document.createElement('td'); tdDir.textContent = cells[3]; tr.appendChild(tdDir);
     tbody.appendChild(tr);
   });
+}
+
+// --- Compress: neuron importance + similar-neuron merging ---
+let _compressPollHandle = null;
+
+function loadCompressPage() {
+  renderCompressJobs();
+  if (_compressPollHandle === null) {
+    _compressPollHandle = setInterval(renderCompressJobs, 3000);
+  }
+}
+
+function stopCompressJobsPolling() {
+  if (_compressPollHandle !== null) {
+    clearInterval(_compressPollHandle);
+    _compressPollHandle = null;
+  }
+}
+
+function _requireCompressModel() {
+  const model = document.getElementById('compress-model').value.trim();
+  if (!model) {
+    alert('Enter a model (HF Hub id or local directory) first.');
+    return null;
+  }
+  return model;
+}
+
+async function _pollCompressJob(jobId, onDone) {
+  // Simple bounded poll: every 1.5s, up to ~5 minutes, stop on done/error.
+  for (let i = 0; i < 200; i++) {
+    await new Promise(res => setTimeout(res, 1500));
+    let payload;
+    try {
+      payload = await api('/api/compress/jobs');
+    } catch (err) {
+      continue;
+    }
+    const job = (payload.jobs || []).find(j => j.job_id === jobId);
+    if (job && (job.status === 'done' || job.status === 'error')) {
+      onDone(job);
+      return;
+    }
+  }
+  onDone(null); // timed out — the Compress jobs table below still has it
+}
+
+async function runImportanceScan() {
+  const model = _requireCompressModel();
+  if (!model) return;
+  const statusEl = document.getElementById('importance-status');
+  const resultsEl = document.getElementById('importance-results');
+  statusEl.textContent = 'Scanning (streamed, one weight matrix at a time)...';
+  resultsEl.innerHTML = '';
+  try {
+    const { job_id } = await api('/api/compress/importance/scan', {
+      method: 'POST',
+      body: JSON.stringify({
+        model,
+        modules: document.getElementById('importance-modules').value,
+        bottom_k: parseInt(document.getElementById('importance-bottomk').value || '10', 10),
+      }),
+    });
+    renderCompressJobs();
+    _pollCompressJob(job_id, job => {
+      if (!job) { statusEl.textContent = 'Still running — check the jobs table below.'; return; }
+      if (job.status === 'error') {
+        statusEl.textContent = 'Error: ' + job.error;
+        statusEl.style.color = 'var(--danger)';
+        return;
+      }
+      statusEl.textContent = 'Done.';
+      statusEl.style.color = 'var(--accent)';
+      renderImportanceResult(job.result);
+    });
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
+function renderImportanceResult(result) {
+  const el = document.getElementById('importance-results');
+  if (!result || !result.layers || result.layers.length === 0) {
+    el.innerHTML = '<div class="empty-state-hint">No scannable weight matrices found.</div>';
+    return;
+  }
+  let html = '<div class="table-wrap"><table><thead><tr><th>Param</th><th>Group</th><th>Neurons</th><th>Least-important indices (norm)</th></tr></thead><tbody>';
+  result.layers.forEach(r => {
+    const least = r.least_important.slice(0, 5).map(x => `#${x.index} (${x.norm.toFixed(3)})`).join(', ');
+    html += `<tr><td>${escapeHtml(r.param_name)}</td><td>${escapeHtml(r.group)}</td><td>${r.n_neurons}</td><td>${escapeHtml(least)}</td></tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+async function runNeuronScan() {
+  const model = _requireCompressModel();
+  if (!model) return;
+  const statusEl = document.getElementById('merge-status');
+  const resultsEl = document.getElementById('merge-results');
+  statusEl.textContent = 'Scanning MLP layers...';
+  resultsEl.innerHTML = '';
+  try {
+    const { job_id } = await api('/api/compress/neurons/scan', {
+      method: 'POST',
+      body: JSON.stringify({
+        model,
+        threshold: parseFloat(document.getElementById('merge-threshold').value),
+        max_pairs_per_layer: parseInt(document.getElementById('merge-maxpairs').value || '50', 10),
+      }),
+    });
+    renderCompressJobs();
+    _pollCompressJob(job_id, job => {
+      if (!job) { statusEl.textContent = 'Still running — check the jobs table below.'; return; }
+      if (job.status === 'error') {
+        statusEl.textContent = 'Error: ' + job.error;
+        statusEl.style.color = 'var(--danger)';
+        return;
+      }
+      statusEl.textContent = `Done — ${job.result.total_pairs} candidate pair(s) across ${job.result.layers_with_candidates} layer(s).`;
+      statusEl.style.color = 'var(--accent)';
+      renderMergeCandidates(job.result.candidates);
+    });
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
+function renderMergeCandidates(candidates) {
+  const el = document.getElementById('merge-results');
+  const layers = Object.keys(candidates || {});
+  if (layers.length === 0) {
+    el.innerHTML = '<div class="empty-state-hint">No candidates at this threshold — try lowering it.</div>';
+    return;
+  }
+  let html = '<div class="table-wrap"><table><thead><tr><th>Layer</th><th>Pairs</th><th>Best sim</th><th>Worst sim</th></tr></thead><tbody>';
+  layers.forEach(idx => {
+    const sims = candidates[idx].map(c => c.joint_similarity);
+    html += `<tr><td>${idx}</td><td>${sims.length}</td><td>${Math.max(...sims).toFixed(4)}</td><td>${Math.min(...sims).toFixed(4)}</td></tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+async function runNeuronApply() {
+  const model = _requireCompressModel();
+  if (!model) return;
+  const outputDir = document.getElementById('merge-outputdir').value.trim();
+  if (!outputDir) {
+    alert('Set an output directory first — Apply writes a new checkpoint there.');
+    return;
+  }
+  if (!confirm(`This will write a new, smaller checkpoint to "${outputDir}". Continue?`)) return;
+
+  const statusEl = document.getElementById('merge-status');
+  statusEl.textContent = 'Applying merge (this holds the model in memory once, like any checkpoint save)...';
+  try {
+    const { job_id } = await api('/api/compress/neurons/apply', {
+      method: 'POST',
+      body: JSON.stringify({
+        model,
+        threshold: parseFloat(document.getElementById('merge-threshold').value),
+        max_pairs_per_layer: parseInt(document.getElementById('merge-maxpairs').value || '50', 10),
+        output_dir: outputDir,
+        allow_nonuniform: document.getElementById('merge-allow-nonuniform').checked,
+      }),
+    });
+    renderCompressJobs();
+    _pollCompressJob(job_id, job => {
+      if (!job) { statusEl.textContent = 'Still running — check the jobs table below.'; return; }
+      if (job.status === 'error') {
+        statusEl.textContent = 'Error: ' + job.error;
+        statusEl.style.color = 'var(--danger)';
+        return;
+      }
+      statusEl.textContent = `Wrote merged model to ${job.result.output_dir}. Re-run your eval suite before shipping.`;
+      statusEl.style.color = 'var(--accent)';
+    });
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
+async function renderCompressJobs() {
+  const el = document.getElementById('compress-jobs');
+  if (!el) return;
+  let payload;
+  try {
+    payload = await api('/api/compress/jobs');
+  } catch (err) {
+    return;
+  }
+  const jobs = payload.jobs || [];
+  if (jobs.length === 0) {
+    el.innerHTML = '<div class="empty-state-hint">No jobs yet.</div>';
+    return;
+  }
+  const badgeMap = { running: 'badge-warning', done: 'badge-success', error: 'badge-danger' };
+  let html = '<div class="table-wrap"><table><thead><tr><th>Kind</th><th>Model</th><th>Status</th></tr></thead><tbody>';
+  jobs.forEach(j => {
+    html += `<tr><td>${escapeHtml(j.kind)}</td><td>${escapeHtml(j.model || '')}</td>` +
+      `<td><span class="badge ${badgeMap[j.status] || 'badge-info'}" title="${escapeHtml(j.error || '')}">${escapeHtml(j.status)}</span></td></tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
 }
 
 // --- Init ---

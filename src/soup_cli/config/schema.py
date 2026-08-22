@@ -3074,6 +3074,16 @@ class TrainingConfig(BaseModel):
             "Supporta AWQ, GPTQ, k/i-quants (GGUF) e QAT."
         ),
     )
+    custom_quant_detail: Optional[str] = Field(
+        default=None,
+        description=(
+            "Dettaglio della quantizzazione scelta in custom_quant_strategy: per awq/gptq è il "
+            "numero di bit ('4' o '8'); per k-quants è un tipo GGUF standard (es. 'Q4_K_M'); per "
+            "i-quants è un formato GGUF avanzato (es. 'IQ4_XS', 'UD-Q4_K_XL' — vedi "
+            "soup_cli.utils.gguf_quant.ALL_ADVANCED_GGUF_FORMATS). None = usa il default del "
+            "formato scelto."
+        ),
+    )
     stream_vram_override: Optional[int] = Field(
         default=None,
         ge=0,
@@ -5115,6 +5125,56 @@ class SoupConfig(BaseModel):
                 "[yellow]Warning: training.ram_cache_gb è impostato ma stream_layers è False. "
                 "La cache RAM è utile solo con il layer streaming attivo.[/]"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_custom_quant_detail(self) -> "SoupConfig":
+        """training.custom_quant_detail must match the value domain of
+        whichever training.custom_quant_strategy it was paired with.
+
+        Deliberately its own validator, not folded into
+        `_validate_stream_layers_compat` above: quantization export detail
+        is independent of layer streaming (an early `return self` there for
+        `stream_layers=False` was silently skipping this check entirely —
+        caught by a round-trip test that expected a 400 and got a 200).
+        """
+        tcfg = self.training
+        if tcfg.custom_quant_detail is not None:
+            detail = tcfg.custom_quant_detail
+            strategy = tcfg.custom_quant_strategy
+            if strategy in ("awq", "gptq"):
+                if detail not in ("4", "8"):
+                    raise ValueError(
+                        f"training.custom_quant_detail={detail!r} non valido per "
+                        f"custom_quant_strategy={strategy!r}: deve essere '4' o '8' "
+                        f"(bit). Vedi soup export --bits."
+                    )
+            elif strategy == "k-quants":
+                from soup_cli.utils.gguf_quant import is_standard_gguf_quant_type
+
+                if not is_standard_gguf_quant_type(detail):
+                    from soup_cli.utils.gguf_quant import STANDARD_GGUF_QUANT_TYPES
+
+                    raise ValueError(
+                        f"training.custom_quant_detail={detail!r} non è un tipo GGUF "
+                        f"standard riconosciuto. Validi: "
+                        f"{', '.join(sorted(STANDARD_GGUF_QUANT_TYPES))}"
+                    )
+            elif strategy == "i-quants":
+                from soup_cli.utils.gguf_quant import is_advanced_gguf_format
+
+                if not is_advanced_gguf_format(detail):
+                    raise ValueError(
+                        f"training.custom_quant_detail={detail!r} non è un formato "
+                        f"GGUF avanzato riconosciuto. Vedi "
+                        f"soup_cli.utils.gguf_quant.ALL_ADVANCED_GGUF_FORMATS."
+                    )
+            else:
+                raise ValueError(
+                    f"training.custom_quant_detail è impostato ma "
+                    f"custom_quant_strategy={strategy!r} non ne prevede uno "
+                    f"(solo awq/gptq/k-quants/i-quants)."
+                )
         return self
 
     @model_validator(mode="after")
