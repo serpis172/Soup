@@ -9,46 +9,33 @@
 </p>
 
 <p align="center">
-  <a href="https://trysoup.dev">Website</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
   <a href="#configuration">Config</a> &middot;
   <a href="#documentation">Docs</a> &middot;
   <a href="docs/commands.md">Commands</a> &middot;
-  <a href="docs/models.md">Models</a> &middot;
-  <a href="https://discord.gg/8RgVbFA6Zq">Discord</a> &middot;
-  <a href="https://www.producthunt.com/products/soup-cli">Product Hunt</a>
+  <a href="docs/models.md">Models</a>
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/soup-cli/"><img src="https://img.shields.io/pypi/v/soup-cli?color=blue" alt="PyPI"></a>
-  <a href="https://pepy.tech/project/soup-cli"><img src="https://img.shields.io/pepy/dt/soup-cli?color=blue" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/python-3.10--3.12-blue" alt="Python 3.10-3.12">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 License">
-  <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/MakazhanAlpamys/65fdc943f85f3b2c46ecddb415c2b779/raw/soup_tests.json" alt="Tests"></a>
-  <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://trysoup.dev"><img src="https://img.shields.io/badge/website-trysoup.dev-blue" alt="Website"></a>
-  <a href="https://discord.gg/8RgVbFA6Zq"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://doi.org/10.5281/zenodo.21771064"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21771064-blue?logo=zenodo&logoColor=white" alt="DOI: 10.5281/zenodo.21771064"></a>
-</p>
-
-<p align="center">
-  <a href="https://www.producthunt.com/products/soup-cli?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-soup-cli">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1217869&amp;theme=dark">
-      <img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1217869&amp;theme=light" alt="Soup CLI - Fine-tune an 8B LLM on a 4 GB laptop GPU | Product Hunt" width="250" height="54">
-    </picture>
-  </a>
 </p>
 
 ---
 
 Soup turns the pain of LLM fine-tuning into a simple workflow. One config, one command, done.
+It also ships a Web UI and a set of optional model-compression tools (neuron-importance
+ranking, similar-neuron merging, SVD compression, a bridge into distillation) on top of the
+core CLI — all opt-in, all covered below.
 
 ```bash
-pip install "soup-cli[train]"   # add [train] to fine-tune; bare `soup-cli` is the light CLI
+git clone <this-repository-url>
+cd soup
+pip install -e ".[train]"   # add [train] to fine-tune; bare -e "." is the light CLI
 soup init --template chat
 soup train
 ```
+
 
 **Fine-tune an 8B model on a 4 GB laptop GPU.** Layer streaming keeps the frozen base out of
 VRAM and feeds it to the GPU one decoder layer at a time. Measured on an RTX 3050 Laptop 4 GB:
@@ -58,7 +45,7 @@ resident run, and reproduced independently on an H100 at 113.00 tok/s in the sam
 −4.8% at 32B; it has not been re-run on a 4 GB card since.) Opt-in (`stream_layers: true`)
 and still BETA —
 [how it works](docs/performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724) ·
-[all measurements](benchmarks/) · [paper](https://doi.org/10.5281/zenodo.21771064) ·
+[all measurements](benchmarks/) ·
 **[check it yourself on a free Colab T4](notebooks/proof-4gb.ipynb)** (caps the process to
 4 GB, then asserts a streamed model is bit-identical to a normal one)
 
@@ -128,6 +115,103 @@ training:
 > used to resolve untested PyTorch wheels that crash in the native extension before Soup
 > runs at all.
 
+## Web UI & model-compression tools
+
+A Web UI and a set of optional model-compression tools sit on top of the core CLI.
+Everything below is opt-in — plain `soup train` on the CLI works exactly as described above
+whether or not you touch any of this.
+
+### Web UI
+
+```bash
+chmod +x start_ui.sh
+./start_ui.sh              # first run: builds the image (10-20 min, compiles llama.cpp)
+                            # later runs: only rebuilds layers that actually changed
+./start_ui.sh --rebuild    # force a clean image if you suspect it's stale/corrupted
+./start_ui.sh --skip-build # relaunch the existing image, no docker build at all
+```
+
+A FastAPI backend (`soup_cli/ui/app.py`) serves the dashboard — the same one `soup ui` runs
+outside Docker — with a Bearer token gating every action that starts training, downloads a
+model, or writes a checkpoint (printed to the console on launch). Prerequisites: Docker with
+NVIDIA Container Toolkit, ~16 GB RAM, an NVIDIA GPU with ≥4 GB VRAM for the Docker path (the
+plain `soup ui` CLI path has no GPU requirement of its own — it shells out to `soup train`,
+which has the normal requirements below).
+
+Pages: **Dashboard** (runs, live CPU/RAM/GPU, a doctor-style health banner), **New
+Training** (template picker + YAML editor, plus a **Streaming & Quantization** panel — RAM
+prefetch slider, quantization format/bit picker, with a live diff of what changed), **Data**,
+**Chat**, **Tool Outputs**, **Model Hub** (search + download models/datasets/benchmarks from
+Hugging Face, with the Hub's own filters), and **Compress** (below). Background jobs
+(downloads, compress scans) toast a notification on completion even if you've navigated
+away.
+
+### Layer RAM prefetch
+
+```yaml
+training:
+  stream_layers: true
+  ram_cache_gb: 8         # 0 = disabled
+```
+
+A single background thread reads upcoming decoder layers ahead of need into pinned host
+RAM, direction-aware (it follows the forward-then-backward zigzag gradient checkpointing
+already produces). Not an LRU cache — that turned out to be the wrong model for a fully
+deterministic access pattern; see `soup_cli/memory/layer_cache.py` for why. The requested
+GB is clamped to a safe fraction of *actually available* system RAM (via `psutil`), so a
+value that doesn't fit gets reduced with a printed warning instead of feeding the OOM
+killer.
+
+### Quantization
+
+```yaml
+training:
+  custom_quant_strategy: awq   # none | awq | gptq | k-quants | i-quants | qat
+  custom_quant_detail: "4"     # bits for awq/gptq; a GGUF type name for k/i-quants
+```
+
+AWQ/GPTQ/GGUF are post-training formats — they need the *trained* checkpoint, not the base
+model, so setting this just prints the exact `soup export` command to run once training
+finishes, rather than pretending to quantize a model that hasn't been trained yet. QAT
+points at the existing BitNet trainer (`soup train --trainer bitnet`) instead of a generic,
+unvalidated `torch.ao.quantization` hook. `custom_quant_detail` is validated against the
+real format registry in `soup_cli/utils/gguf_quant.py` — the same one the WebUI's dropdown
+is populated from, so the two can't drift apart.
+
+### `soup compress` — optional model-density tools
+
+None of this runs automatically, and nothing writes a checkpoint without `--apply`.
+
+- **`soup compress importance --model <path>`** — ranks output neurons by weight
+  magnitude (default, streamed, no data needed) or `--metric wanda` (activation-weighted,
+  needs the model loaded + `--calibration-data`, catches neurons whose large weights
+  cancel out on real inputs).
+- **`soup compress neurons --model <path> [--apply --output-dir <dir>]`** — finds
+  MLP/FFN intermediate neurons that are near-duplicates (gate_proj **and** up_proj rows
+  both highly similar — that joint condition is what makes the merge safe without
+  calibration data) and merges them, folding the dropped neuron's output contribution into
+  the kept one's. `--eval-data` compares perplexity before/after on real text as part of
+  the same run.
+- **`soup compress svd --model <path> --mode denoise|factorize [--apply --output-dir <dir>]`**
+  — `denoise` replaces a matrix with its best low-rank reconstruction at the *same shape*
+  (always loads with stock `transformers`, doesn't shrink the file, removes low-signal
+  noise — the same idea `soup spectrum` already uses for SNR-based LoRA targeting, applied
+  to compression). `factorize` splits a matrix into two smaller ones for a genuine size
+  reduction; the result needs custom loading code (`svd_manifest.json` documents exactly
+  how) and is not loadable by plain `AutoModelForCausalLM.from_pretrained`.
+- **`soup compress distill-config --student <compressed> --teacher <original>`** — Soup
+  already has a full token/sequence-level distillation trainer (`task: distill`,
+  `soup_cli/trainer/distill.py`); this generates a ready-to-run config pointing it at your
+  compressed model as the student and the pre-compression original as the teacher, for a
+  quality-recovery pass. Doesn't reimplement training — just wires the existing trainer to
+  the natural next step after pruning/merging.
+
+Scope, stated plainly: MLP/FFN neurons only (attention-head merging has more structure —
+per-head grouping, GQA, RoPE — and isn't attempted here); merge quality is bounded, not
+guaranteed (measured on synthetic weights: ~0.3% median output error at 0.998 similarity,
+~1.3% at 0.97 — `--eval-data` lets you check on your own text instead of trusting that
+number).
+
 <details>
 <summary>Previous release — v0.72.4, align on a laptop (DPO / ORPO / SimPO / KTO over layer streaming)</summary>
 
@@ -185,31 +269,31 @@ soup ship --base ./base --adapter ./my-lora --task-eval my_task.jsonl
 
 </details>
 
-Full history: [CHANGELOG.md](CHANGELOG.md) &middot; [GitHub Releases](https://github.com/MakazhanAlpamys/Soup/releases).
+Full history: [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick Start
 
 ### 1. Install
 
 ```bash
+git clone <this-repository-url>
+cd soup
+
 # Light core: CLI + config + data tools, no PyTorch
-pip install soup-cli
+pip install -e "."
 
 # Add the training stack (torch, transformers, peft, trl, datasets, …)
-pip install "soup-cli[train]"
+pip install -e ".[train]"
 
 # Everything (train + serve + ui + data) in one shot
-pip install "soup-cli[all]"
-
-# Or from GitHub (latest dev)
-pip install git+https://github.com/MakazhanAlpamys/Soup.git
+pip install -e ".[all]"
 ```
 
 The full extras table (`fast`, `mlx`, `serve`, `eval`, `ui`, `vision`, `audio`, …) lives in
 [`docs/models.md`](docs/models.md#optional-extras).
 
-> **Double quotes, not single.** `"soup-cli[train]"` is the only spelling that works in every
-> shell — `cmd.exe`, PowerShell, bash and zsh. If you copied `'soup-cli[train]'` from an older
+> **Double quotes, not single.** `".[train]"` is the only spelling that works in every
+> shell — `cmd.exe`, PowerShell, bash and zsh. If you copied `'.[train]'` from an older
 > tutorial and pip rejected it, that is the reason:
 > [why, and the exact error](docs/models.md#quoting-the-extra).
 
@@ -247,7 +331,7 @@ A complete `soup.yaml`:
 ```yaml
 base: meta-llama/Llama-3.1-8B-Instruct
 task: sft
-# backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
+# backend: unsloth  # 2-5x faster, pip install -e ".[fast]"
 
 data:
   train: ./data/train.jsonl
@@ -333,11 +417,12 @@ Full model + vision tables and the optional-extras matrix are in [`docs/models.m
 
 ## Docker
 
-Run Soup without installing CUDA or PyTorch locally (image published to GHCR on every release):
+Run Soup without installing CUDA or PyTorch locally — build the image from this repo (see
+`Dockerfile.ui` for the Web UI image, `./start_ui.sh` to build and run it in one step):
 
 ```bash
-docker pull ghcr.io/makazhanalpamys/soup:latest
-docker run --gpus all -v $(pwd):/workspace ghcr.io/makazhanalpamys/soup train --config soup.yaml
+docker build -f Dockerfile.ui -t soup .
+docker run --gpus all -v $(pwd):/workspace soup train --config soup.yaml
 docker compose up   # or build locally
 ```
 
@@ -366,8 +451,8 @@ soup doctor    # GPU, system resources, dependencies, and version in one place
 ## Development
 
 ```bash
-git clone https://github.com/MakazhanAlpamys/Soup.git
-cd Soup
+git clone <this-repository-url>
+cd soup
 pip install -e ".[dev]"
 
 ruff check src/soup_cli/ tests/    # lint
@@ -380,111 +465,12 @@ pre-commit install                 # optional: ruff lint+format on commit
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and [SECURITY.md](SECURITY.md) to
 report a vulnerability.
 
-## Support Soup
+## Contributing
 
-Soup is Apache-2.0 and free — and stays that way. It is built and maintained in the open on a
-single 4 GB laptop, which is why every performance number in these docs is measured rather than
-claimed.
-
-If Soup saved you a training run, [starring the repo](https://github.com/MakazhanAlpamys/Soup)
-helps most, and it costs nothing. If you would like to fund the work directly:
-
-**[❤️ Donate](https://buy.stripe.com/4gMcN441k3pha3T19ye7m04)** — one-off, any amount (use
-*Change amount* on the checkout page). Payments are processed by Stripe under the maintainer's
-registered business, **MePlay, Inc.** — that name, not "Soup", is what appears on the checkout
-page and on your card statement.
-
-Donations buy GPU time for the hardware-gated work — multi-GPU, 8B+ validation, Apple Silicon —
-that a single 4 GB laptop cannot reach.
-
-The other way to move exactly those items is **hardware itself**. They ship behind honest
-"requires \<hardware\>" gates rather than unverified claims, so if you have access to a bigger
-box — or GPU credits going unused — running one of the
-[`help wanted`](https://github.com/MakazhanAlpamys/Soup/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
-issues and posting the numbers helps as much as funding the GPU time would. Those issues say
-exactly what is blocked on hardware today.
-
-## Contributors
-
-Built by the community ❤️ — thank you to everyone who has contributed. See
-[CONTRIBUTORS.md](CONTRIBUTORS.md).
-
-[![Contributors](https://contrib.rocks/image?repo=MakazhanAlpamys/Soup)](https://github.com/MakazhanAlpamys/Soup/graphs/contributors)
-
-## Contact
-
-Bugs and feature requests belong in the
-[issue tracker](https://github.com/MakazhanAlpamys/Soup/issues), questions in
-[Discussions](https://github.com/MakazhanAlpamys/Soup/discussions) — both get answered faster
-and help the next person with the same problem.
-
-For live chat, setup help, and everything that reads better as a conversation, join the
-[Discord](https://discord.gg/8RgVbFA6Zq). Anything that should still be findable in six months
-belongs in Issues or Discussions — a Discord answer helps one person, an issue helps everyone
-who hits the same thing. The [Code of Conduct](CODE_OF_CONDUCT.md) applies there too.
-
-For anything that does not fit in public — security reports (see [SECURITY.md](SECURITY.md)),
-Code of Conduct matters, or press — email **team@trysoup.dev**. That is the project address
-and the right one for anything Soup-related. **makazanalpamys@gmail.com** is the maintainer's
-personal address; it reaches the same person and is a fine fallback.
-
-## Citing Soup
-
-Layer streaming — training an 8B model on a 4 GB laptop GPU by streaming the frozen base from
-host RAM one decoder layer at a time — is described in a preprint, together with the correctness
-protocol that verifies a streamed run against a resident one (forward and backward stated
-separately, because they are two claims and not one).
-
-> Makazhan, A. (2026). *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop
-> GPU* (v3). Zenodo. https://doi.org/10.5281/zenodo.21918325
-
-**Version 3 (13 August 2026) is current.** The title and the claim are unchanged — 8B on 4 GB —
-and no measured number has changed since v1. What v3 does is **withdraw an explanation we had
-published**, which is also the shortest way to describe what the paper is for:
-
-- **Retracted in v3: "layer streaming is bound by host-to-device transfer, not by the GPU."**
-  That was an *inference* from the H100 replication below, and it had never been measured. We
-  measured it on 11 August and it is false at the published configuration: deleting every
-  host-to-device byte buys **1.4%**, the compute stream waits on a copy for **0.20%** of the
-  step, and the step runs at **71.3%** of that card's same-session GEMM ceiling. The largest
-  streaming-specific cost is the per-layer NF4 dequantisation, at 9.8%
-  ([the record](benchmarks/probe-v0.73.0-what-bounds-streaming.md)). Every measurement stands;
-  the replication survives in a weaker form — the constraint is common to both machines and is
-  not the GPU's compute.
-- **Replication on hardware nothing like the original** (added in v2): 119.6 tok/s on the RTX
-  3050 against a median 113.00 on an H100, at the same 3.32 GB peak.
-- **A silent wrong-gradient defect, found and repaired.** On NF4 above ~165 MiB per layer the
-  forward stayed bit-exact and the loss curve looked healthy while the gradients were wrong. The
-  cause is named in the upstream library and reported there; the repair is gated against controls
-  on real 32B and 72B.
-- **Bit-exactness at real model sizes** instead of three-layer toys: forward from 0.5B to 72B,
-  backward at 8B and 14B.
-- **Trained-model quality, measured for the first time**, and indistinguishable from a resident run.
-- **A comparison against DeepSpeed** — including the result that does not flatter us: eight cards
-  of ZeRO-3 are slower than one card training resident.
-- **The limitations section rewritten**: of v1's ten items, one closed and four more narrowed,
-  and seven new ones added.
-
-Cite the version you used. `10.5281/zenodo.21771064` is the concept DOI and always resolves to
-the latest version (v3 today); v1 and v2 remain citable at their own version DOIs and are not
-edited — the retraction above is a new version precisely so that the record of what we claimed,
-and when, stays intact.
-
-The measurement records behind every number in it are in [`benchmarks/`](benchmarks/), published
-as written — including the failures, the assumptions that turned out wrong, and the numbers that
-were measured and then discarded.
-
-```bibtex
-@misc{makazhan2026exact,
-  title        = {Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop GPU},
-  author       = {Makazhan, Alpamys},
-  year         = {2026},
-  publisher    = {Zenodo},
-  version      = {v3},
-  doi          = {10.5281/zenodo.21918325},
-  url          = {https://doi.org/10.5281/zenodo.21918325}
-}
-```
+Soup is Apache-2.0 and free — and stays that way. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the full workflow and [SECURITY.md](SECURITY.md) to report a vulnerability. Bugs and feature
+requests belong in the issue tracker; the [Code of Conduct](CODE_OF_CONDUCT.md) applies
+throughout.
 
 ## License
 

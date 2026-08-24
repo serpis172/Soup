@@ -1,3 +1,8 @@
+# syntax=docker/dockerfile:1
+# BuildKit cache mounts below (--mount=type=cache) need syntax >=1.2, hence
+# the pragma. Build with `DOCKER_BUILDKIT=1 docker build ...` (start_ui.sh
+# does this for you).
+
 # Use NVIDIA CUDA 12.1 DEVELOPMENT image (not runtime)
 FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
 
@@ -27,38 +32,64 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
 
 WORKDIR /workspace
 
-# Copy your fork
-COPY . /workspace
+# --- Dependency layer (cached independently of source changes) -------------
+# Only the dependency manifest + README (pyproject.toml's `readme` field
+# points at it, so setuptools needs it present even for metadata-only
+# resolution) are copied here — NOT the full source tree. This is the fix
+# for "reinstalls everything from scratch every rebuild": previously
+# `COPY . /workspace` ran BEFORE every pip install below, so editing a
+# single .py file busted Docker's layer cache for every install that
+# followed it — including the from-source CUDA compile of
+# llama-cpp-python, the slowest step in this whole file by a wide margin.
+# Now those installs only re-run when pyproject.toml itself changes.
+COPY pyproject.toml README.md* ./
+RUN mkdir -p src/soup_cli && touch src/soup_cli/__init__.py
 
-# Install Soup from your local fork (editable mode)
-# Bug fix: was missing the `ui` extra (fastapi/uvicorn) from pyproject.toml's
-# own [project.optional-dependencies] and separately hand-installing gradio +
-# raw fastapi/uvicorn/psutil below instead — pulling in an entirely different,
-# disconnected web framework nothing in this image actually serves. Use the
-# extra pyproject.toml already declares for this.
-RUN pip install --no-cache-dir -e ".[train,serve,data,eval,ui]"
+# pip's own wheel/download cache also persists *across separate builds*
+# (not just within one image's layer history) via a BuildKit cache mount —
+# belt-and-braces on top of the layer-ordering fix above.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -e ".[train,serve,data,eval,ui]"
 
 # Install quantization libraries with pre-compiled wheels where possible
 # GPTQ: use pre-built wheel if available, otherwise compile
-RUN pip install --no-cache-dir auto-gptq --extra-index-url https://huggingface.github.io/autogptq-index/whl/cu121/ || \
-    pip install --no-cache-dir auto-gptq --no-build-isolation
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install auto-gptq --extra-index-url https://huggingface.github.io/autogptq-index/whl/cu121/ || \
+    pip install auto-gptq --no-build-isolation
 
 # AWQ: usually has pre-built wheels
-RUN pip install --no-cache-dir autoawq || \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install autoawq || \
     echo "Warning: autoawq installation failed, continuing without AWQ support"
 
 # Optimum for additional quantization support
-RUN pip install --no-cache-dir optimum
+RUN --mount=type=cache,target=/root/.cache/pip pip install optimum
 
-# llama-cpp-python with CUDA support
-RUN CMAKE_ARGS="-DGGML_CUDA=on -DCUDA_DOCKER_ARCH=all" \
-    pip install --no-cache-dir llama-cpp-python --no-build-isolation
+# llama-cpp-python with CUDA support.
+# Bug fix: `--no-build-isolation` means pip does NOT set up an isolated
+# build env, so llama-cpp-python's own build backend (scikit-build-core,
+# which drives its CMake build) has to already be installed in *this*
+# environment first — it wasn't, hence `ModuleNotFoundError:
+# scikit_build_core`. This is llama-cpp-python's own documented fix for
+# exactly this flag combination, not a guess.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install scikit-build-core[pyproject] cmake ninja
+RUN --mount=type=cache,target=/root/.cache/pip \
+    CMAKE_ARGS="-DGGML_CUDA=on -DCUDA_DOCKER_ARCH=all" \
+    pip install llama-cpp-python --no-build-isolation
 
 # psutil for RAM-aware layer streaming / RAM-cache sizing (utils/layer_stream.py,
 # memory/layer_cache.py). fastapi/uvicorn/gradio dropped: they duplicated the
 # `ui` extra above, and gradio was never used by anything soup_cli actually
 # imports — see soup_cli/ui/app.py (the real, FastAPI-based dashboard).
-RUN pip install --no-cache-dir "psutil>=5.9.0"
+RUN --mount=type=cache,target=/root/.cache/pip pip install "psutil>=5.9.0"
+
+# --- Source layer (invalidated by every code change — cheap by design) -----
+RUN rm -rf src  # drop the metadata-only stub from the dependency layer
+COPY . /workspace
+# --no-deps: every dependency was already resolved and installed above from
+# pyproject.toml alone: this just links the real source in, no re-resolve.
+RUN pip install --no-cache-dir -e . --no-deps
 
 EXPOSE 7860
 

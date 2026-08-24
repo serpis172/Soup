@@ -114,6 +114,78 @@ def row_l2_norms(matrix: "NDArray[Any]") -> "NDArray[Any]":
     return np.linalg.norm(a, axis=1)
 
 
+def rank_importance_wanda(
+    model_path: str,
+    calibration_texts: List[str],
+    *,
+    modules: str = "mlp,attn",
+    max_length: int = 512,
+    device: Optional[str] = None,
+) -> Tuple[NeuronImportance, ...]:
+    """Load the real model + tokenizer and rank neurons via Wanda instead of
+    plain magnitude. Heavier than :func:`rank_importance` (needs the full
+    model resident, not just streamed weight files) — that's the documented
+    tradeoff for catching neurons magnitude alone would miss.
+
+    Returns the same :class:`NeuronImportance` shape as
+    :func:`rank_importance` so callers (CLI table, UI, JSON export) don't
+    need to know which metric produced the ranking.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from soup_cli.utils.trust_remote import model_requires_trust_remote_code
+
+    trust_remote_code = bool(model_requires_trust_remote_code(model_path))
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code, dtype=torch.float32
+    )
+    if device:
+        model = model.to(device)
+
+    mod_filter = {m.strip() for m in modules.split(",")} if modules != "all" else None
+
+    def _wanted(name: str) -> bool:
+        if mod_filter is None:
+            return True
+        # classify_module expects parameter-style names (ending in
+        # ".weight", matching safetensors keys / iter_weight_matrices) —
+        # model.named_modules() gives *module* names without that suffix.
+        # Without appending it here, every mlp/attn module silently failed
+        # to match, target_names collapsed to an empty list -> `or None`
+        # -> "score everything" (including lm_head) despite --modules
+        # filtering to mlp/attn only. Confirmed via a real Llama-arch test
+        # model where lm_head showed up in a mlp,attn-filtered scan.
+        kind = classify_module(f"{name}.weight")
+        return kind in mod_filter
+
+    target_names = [
+        name
+        for name, mod in model.named_modules()
+        if isinstance(mod, torch.nn.Linear) and _wanted(name)
+    ] or None
+
+    calib_ids = [
+        tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")["input_ids"]
+        for text in calibration_texts
+        if text and text.strip()
+    ]
+    if not calib_ids:
+        raise ValueError("no usable calibration text (all lines empty after stripping)")
+
+    scores = compute_wanda_importance(model, calib_ids, target_names=target_names)
+    return tuple(
+        NeuronImportance(
+            param_name=f"{name}.weight",
+            group=layer_type_signature(name),
+            module_type=classify_module(name) or "other",
+            row_norms=tuple(float(x) for x in arr),
+        )
+        for name, arr in scores.items()
+    )
+
+
 def rank_importance(
     weights_dir: str, *, modules: str = "all"
 ) -> Tuple[NeuronImportance, ...]:
@@ -503,3 +575,183 @@ def apply_merges_to_checkpoint(
             json_mod.dump(config, fh, indent=2)
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Wanda importance (activation-weighted, needs a loaded model + calibration data)
+# ---------------------------------------------------------------------------
+#
+# Sun et al., "A Simple and Effective Pruning Approach for Large Language
+# Models" (Wanda, ICLR 2024): per-weight score S_ij = |W_ij| * ||X_j||_2,
+# where X_j is the j-th input feature's activation norm over calibration
+# data. No backward pass needed — just forward passes to collect activation
+# statistics — but unlike row_l2_norms() above, it does need the actual
+# model loaded (not just streamed weight files) and a calibration batch,
+# so it's opt-in and heavier by nature. Aggregated per output row (neuron)
+# the same way as the magnitude-only score, for a like-for-like ranking.
+
+
+def compute_wanda_importance(
+    model: Any,
+    calibration_input_ids: List[Any],
+    *,
+    target_names: Optional[List[str]] = None,
+    device: Optional[str] = None,
+) -> Dict[str, "NDArray[Any]"]:
+    """Per-output-neuron Wanda importance for every ``nn.Linear`` in ``model``.
+
+    Args:
+        model: a loaded ``torch.nn.Module`` (e.g. from
+            ``AutoModelForCausalLM.from_pretrained``), already on the
+            device you want the forward passes to run on.
+        calibration_input_ids: list of 1-D or 2-D LongTensors (token ids)
+            to forward through the model. A few dozen sequences of a few
+            hundred tokens each is typically enough (this is exactly the
+            calibration-set size Wanda's own paper uses).
+        target_names: if given, only ``nn.Linear`` modules whose qualified
+            name is in this list are scored (matches the ``.weight`` keys
+            used elsewhere in this module, e.g.
+            ``model.layers.0.mlp.down_proj``). Defaults to every Linear.
+
+    Returns:
+        ``{module_name: np.ndarray[n_out]}`` — same shape/semantics as
+        stacking :func:`row_l2_norms` outputs, so results from both are
+        directly comparable.
+    """
+    import torch
+
+    np = _np()
+    model.eval()
+    if device is not None:
+        model = model.to(device)
+
+    linears = {
+        name: mod
+        for name, mod in model.named_modules()
+        if isinstance(mod, torch.nn.Linear) and (target_names is None or name in target_names)
+    }
+    if not linears:
+        raise ValueError("no matching nn.Linear modules found to score")
+
+    sq_sum: Dict[str, "torch.Tensor"] = {}
+    n_samples: Dict[str, int] = {}
+    handles = []
+
+    def _make_hook(name: str):
+        def _hook(_module, inputs):
+            x = inputs[0].detach()
+            x = x.reshape(-1, x.shape[-1]).to(torch.float32)
+            s = (x * x).sum(dim=0)
+            if name not in sq_sum:
+                sq_sum[name] = s
+                n_samples[name] = x.shape[0]
+            else:
+                sq_sum[name] = sq_sum[name] + s
+                n_samples[name] += x.shape[0]
+
+        return _hook
+
+    for name, mod in linears.items():
+        handles.append(mod.register_forward_pre_hook(_make_hook(name)))
+
+    try:
+        with torch.no_grad():
+            for ids in calibration_input_ids:
+                ids = ids if hasattr(ids, "dim") else torch.as_tensor(ids)
+                if ids.dim() == 1:
+                    ids = ids.unsqueeze(0)
+                ids = ids.to(next(model.parameters()).device)
+                model(ids)
+    finally:
+        for h in handles:
+            h.remove()
+
+    result: Dict[str, "NDArray[Any]"] = {}
+    for name, mod in linears.items():
+        if name not in sq_sum:
+            continue  # module never actually ran (e.g. unused expert in a MoE)
+        norm_x = torch.sqrt(sq_sum[name]).cpu().numpy().astype(np.float32)
+        w = mod.weight.detach().cpu().numpy().astype(np.float32)  # [n_out, n_in]
+        scores = np.abs(w) * norm_x[np.newaxis, :]
+        result[name] = np.linalg.norm(scores, axis=1)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Quick eval: perplexity before/after, for a "does this merge actually hurt
+# the model" check before committing to --apply on real data.
+# ---------------------------------------------------------------------------
+
+
+def compute_perplexity(model: Any, tokenizer: Any, texts: List[str], *, max_length: int = 512) -> float:
+    """Mean per-token cross-entropy perplexity of ``model`` over ``texts``.
+
+    Standard next-token perplexity (each text scored independently, no
+    cross-document context) — good enough for a relative before/after
+    comparison, which is all a quick sanity check needs.
+    """
+    import math
+
+    import torch
+
+    model.eval()
+    device = next(model.parameters()).device
+    total_nll = 0.0
+    total_tokens = 0
+    with torch.no_grad():
+        for text in texts:
+            if not text or not text.strip():
+                continue
+            enc = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
+            input_ids = enc["input_ids"].to(device)
+            if input_ids.shape[1] < 2:
+                continue
+            out = model(input_ids=input_ids, labels=input_ids)
+            n_tokens = input_ids.shape[1] - 1  # labels shifted internally by the model
+            total_nll += float(out.loss) * n_tokens
+            total_tokens += n_tokens
+    if total_tokens == 0:
+        raise ValueError("no usable text for perplexity (all too short/empty)")
+    return math.exp(total_nll / total_tokens)
+
+
+def quick_eval_merge(
+    original_model_path: str,
+    merged_weights_dir: str,
+    eval_texts: List[str],
+    *,
+    max_length: int = 512,
+) -> Dict[str, Any]:
+    """Load the original and a just-merged checkpoint, compare perplexity.
+
+    Both models load in full (this is the "hold it in memory once" cost
+    already documented for --apply — this just also loads the original for
+    the comparison, so it's heavier than either alone, by design: it's an
+    opt-in sanity check, not something that runs on every merge).
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from soup_cli.utils.trust_remote import model_requires_trust_remote_code
+
+    trust_remote_code = bool(model_requires_trust_remote_code(original_model_path))
+    tokenizer = AutoTokenizer.from_pretrained(original_model_path, trust_remote_code=trust_remote_code)
+
+    original_model = AutoModelForCausalLM.from_pretrained(
+        original_model_path, trust_remote_code=trust_remote_code, dtype=torch.float32
+    )
+    ppl_before = compute_perplexity(original_model, tokenizer, eval_texts, max_length=max_length)
+    del original_model
+
+    merged_model = AutoModelForCausalLM.from_pretrained(
+        merged_weights_dir, trust_remote_code=trust_remote_code, dtype=torch.float32
+    )
+    ppl_after = compute_perplexity(merged_model, tokenizer, eval_texts, max_length=max_length)
+    del merged_model
+
+    return {
+        "perplexity_before": ppl_before,
+        "perplexity_after": ppl_after,
+        "relative_increase_pct": 100.0 * (ppl_after - ppl_before) / ppl_before,
+        "n_texts": len(eval_texts),
+    }

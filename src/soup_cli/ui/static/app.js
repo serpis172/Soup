@@ -101,6 +101,7 @@ function navigate(page) {
   if (page !== 'tools') stopToolOutputsPolling();
   if (page !== 'modelhub') stopHubDownloadsPolling();
   if (page !== 'compress') stopCompressJobsPolling();
+  if (page !== 'dashboard') stopDashboardLivePolling();
 }
 
 // --- Tool Outputs panel (v0.53.10 #155) ---
@@ -236,6 +237,8 @@ function truncate(str, len = 30) {
 }
 
 // --- Dashboard ---
+let _dashboardLivePollHandle = null;
+
 async function loadDashboard() {
   try {
     const [runsResp, sysResp] = await Promise.all([
@@ -249,6 +252,71 @@ async function loadDashboard() {
     document.getElementById('dashboard-content').innerHTML =
       `<div class="empty-state"><div class="empty-state-text">Error loading dashboard: ${escapeHtml(err.message)}</div></div>`;
   }
+  renderHealthBanner();
+  if (_dashboardLivePollHandle === null) {
+    renderLiveResources();
+    _dashboardLivePollHandle = setInterval(renderLiveResources, 4000);
+  }
+}
+
+function stopDashboardLivePolling() {
+  if (_dashboardLivePollHandle !== null) {
+    clearInterval(_dashboardLivePollHandle);
+    _dashboardLivePollHandle = null;
+  }
+}
+
+async function renderHealthBanner() {
+  const el = document.getElementById('health-banner');
+  if (!el) return;
+  try {
+    const health = await api('/api/system/health');
+    if (health.ok) {
+      el.innerHTML = '';
+      return;
+    }
+    el.innerHTML = `<div class="card" style="border-left:3px solid var(--danger);margin-bottom:1rem">` +
+      `<div class="card-title" style="margin-bottom:0.35rem">⚠ Check before you train</div>` +
+      health.issues.map(i => `<div style="font-size:0.85rem;color:var(--text-dim)">${escapeHtml(i)}</div>`).join('') +
+      `<div style="font-size:0.8rem;margin-top:0.4rem"><code>soup doctor</code> for the full diagnostic.</div></div>`;
+  } catch (err) {
+    el.innerHTML = '';
+  }
+}
+
+async function renderLiveResources() {
+  const dashboardContent = document.getElementById('dashboard-content');
+  if (!dashboardContent) return;
+  let live;
+  try {
+    live = await api('/api/system/live');
+  } catch (err) {
+    return;
+  }
+  let el = document.getElementById('live-resources');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'live-resources';
+    el.className = 'card';
+    dashboardContent.prepend(el);
+  }
+  const bar = (label, pct) => `
+    <div style="margin-bottom:0.5rem">
+      <div style="display:flex;justify-content:space-between;font-size:0.8rem;color:var(--text-dim)">
+        <span>${escapeHtml(label)}</span><span>${pct == null ? '-' : pct.toFixed(0) + '%'}</span>
+      </div>
+      <div class="progress-bar"><div class="progress-bar-fill" style="width:${pct || 0}%"></div></div>
+    </div>`;
+  let html = '<div class="card-title">Live resources</div>';
+  html += bar('CPU', live.cpu_pct);
+  html += bar('RAM', live.ram_pct);
+  (live.gpu || []).forEach(g => {
+    html += bar(`GPU ${g.index} (${escapeHtml(g.name)}) — ${g.memory_used_gb}/${g.memory_total_gb} GB`, g.memory_pct);
+  });
+  if (!live.gpu || live.gpu.length === 0) {
+    html += '<div class="empty-state-hint">No CUDA GPU detected.</div>';
+  }
+  el.innerHTML = html;
 }
 
 function renderDashboard() {
@@ -629,6 +697,25 @@ function onQuantStrategyChange() {
   }
 }
 
+function renderConfigDiff(before, after) {
+  const el = document.getElementById('config-diff');
+  if (!el) return;
+  const beforeLines = before.split('\n');
+  const afterLines = after.split('\n');
+  const beforeSet = new Set(beforeLines);
+  const afterSet = new Set(afterLines);
+  const added = afterLines.filter(l => l.trim() && !beforeSet.has(l));
+  const removed = beforeLines.filter(l => l.trim() && !afterSet.has(l));
+  if (added.length === 0 && removed.length === 0) {
+    el.innerHTML = '<div class="empty-state-hint">No change.</div>';
+    return;
+  }
+  let html = '<div class="code-block" style="font-size:0.8rem">';
+  removed.forEach(l => { html += `<div style="color:var(--danger)">- ${escapeHtml(l)}</div>`; });
+  added.forEach(l => { html += `<div style="color:var(--accent)">+ ${escapeHtml(l)}</div>`; });
+  html += '</div>';
+  el.innerHTML = html;
+}
 function onRamCacheSliderInput() {
   const v = parseFloat(document.getElementById('ram-cache-slider').value || '0');
   document.getElementById('ram-cache-val').textContent =
@@ -645,6 +732,7 @@ async function applyStreamingSettings() {
   const detail = (quant !== 'none' && detailSelect.options.length) ? detailSelect.value : '';
   statusEl.textContent = 'Applying...';
   statusEl.style.color = 'var(--text-dim)';
+  const before = editor.value;
   try {
     const result = await api('/api/config/patch-training', {
       method: 'POST',
@@ -658,6 +746,7 @@ async function applyStreamingSettings() {
     editor.value = result.yaml;
     statusEl.textContent = 'Applied to config below.';
     statusEl.style.color = 'var(--accent)';
+    renderConfigDiff(before, result.yaml);
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message;
     statusEl.style.color = 'var(--danger)';
@@ -1320,12 +1409,31 @@ async function _pollCompressJob(jobId, onDone) {
   onDone(null); // timed out — the Compress jobs table below still has it
 }
 
+function onImportanceMetricChange() {
+  const metric = document.getElementById('importance-metric').value;
+  document.getElementById('importance-calib-group').style.display = metric === 'wanda' ? '' : 'none';
+}
+
 async function runImportanceScan() {
   const model = _requireCompressModel();
   if (!model) return;
   const statusEl = document.getElementById('importance-status');
   const resultsEl = document.getElementById('importance-results');
-  statusEl.textContent = 'Scanning (streamed, one weight matrix at a time)...';
+  const metric = document.getElementById('importance-metric').value;
+
+  let calibrationTexts = null;
+  if (metric === 'wanda') {
+    calibrationTexts = document.getElementById('importance-calib-text').value
+      .split('\n').map(s => s.trim()).filter(Boolean);
+    if (calibrationTexts.length === 0) {
+      alert('Wanda needs at least a few lines of calibration text.');
+      return;
+    }
+  }
+
+  statusEl.textContent = metric === 'wanda'
+    ? 'Loading model + scoring on calibration text (heavier than magnitude)...'
+    : 'Scanning (streamed, one weight matrix at a time)...';
   resultsEl.innerHTML = '';
   try {
     const { job_id } = await api('/api/compress/importance/scan', {
@@ -1334,6 +1442,8 @@ async function runImportanceScan() {
         model,
         modules: document.getElementById('importance-modules').value,
         bottom_k: parseInt(document.getElementById('importance-bottomk').value || '10', 10),
+        metric,
+        calibration_texts: calibrationTexts,
       }),
     });
     renderCompressJobs();
@@ -1342,11 +1452,13 @@ async function runImportanceScan() {
       if (job.status === 'error') {
         statusEl.textContent = 'Error: ' + job.error;
         statusEl.style.color = 'var(--danger)';
+        pushToast('Importance scan failed: ' + job.error, 'error');
         return;
       }
       statusEl.textContent = 'Done.';
       statusEl.style.color = 'var(--accent)';
       renderImportanceResult(job.result);
+      pushToast('Importance scan complete (' + job.result.metric + ')', 'success');
     });
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message;
@@ -1427,8 +1539,20 @@ async function runNeuronApply() {
   }
   if (!confirm(`This will write a new, smaller checkpoint to "${outputDir}". Continue?`)) return;
 
+  const evalEnabled = document.getElementById('merge-eval-enable').checked;
+  let evalTexts = null;
+  if (evalEnabled) {
+    evalTexts = document.getElementById('merge-eval-text').value
+      .split('\n').map(s => s.trim()).filter(Boolean);
+    if (evalTexts.length === 0) evalTexts = null;
+  }
+
   const statusEl = document.getElementById('merge-status');
-  statusEl.textContent = 'Applying merge (this holds the model in memory once, like any checkpoint save)...';
+  document.getElementById('merge-eval-result').innerHTML = '';
+  document.getElementById('merge-distill-suggest').innerHTML = '';
+  statusEl.textContent = evalTexts
+    ? 'Applying merge + quick eval (loads original AND merged model — slower)...'
+    : 'Applying merge (this holds the model in memory once, like any checkpoint save)...';
   try {
     const { job_id } = await api('/api/compress/neurons/apply', {
       method: 'POST',
@@ -1438,6 +1562,7 @@ async function runNeuronApply() {
         max_pairs_per_layer: parseInt(document.getElementById('merge-maxpairs').value || '50', 10),
         output_dir: outputDir,
         allow_nonuniform: document.getElementById('merge-allow-nonuniform').checked,
+        eval_texts: evalTexts,
       }),
     });
     renderCompressJobs();
@@ -1446,14 +1571,164 @@ async function runNeuronApply() {
       if (job.status === 'error') {
         statusEl.textContent = 'Error: ' + job.error;
         statusEl.style.color = 'var(--danger)';
+        pushToast('Merge apply failed: ' + job.error, 'error');
         return;
       }
       statusEl.textContent = `Wrote merged model to ${job.result.output_dir}. Re-run your eval suite before shipping.`;
       statusEl.style.color = 'var(--accent)';
+      pushToast('Merge applied: ' + job.result.output_dir, 'success');
+      if (job.result.quick_eval) {
+        const qe = job.result.quick_eval;
+        document.getElementById('merge-eval-result').innerHTML =
+          `<div class="empty-state-hint">Perplexity: ${qe.perplexity_before.toFixed(3)} -> ` +
+          `${qe.perplexity_after.toFixed(3)} (${qe.relative_increase_pct >= 0 ? '+' : ''}${qe.relative_increase_pct.toFixed(2)}%) ` +
+          `over ${qe.n_texts} samples.</div>`;
+      }
+      document.getElementById('merge-distill-suggest').innerHTML =
+        '<button class="btn btn-sm">Prefill distillation config with this result</button>';
+      document.getElementById('merge-distill-suggest').querySelector('button').onclick = () => {
+        document.getElementById('distill-student').value = job.result.output_dir;
+        document.getElementById('distill-teacher').value = model;
+        document.getElementById('distill-student').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      };
     });
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message;
   }
+}
+
+// --- SVD compression ---
+
+async function runSvdScan() {
+  const model = _requireCompressModel();
+  if (!model) return;
+  const statusEl = document.getElementById('svd-status');
+  const resultsEl = document.getElementById('svd-results');
+  statusEl.textContent = 'Analyzing singular value spectra...';
+  resultsEl.innerHTML = '';
+  try {
+    const { job_id } = await api('/api/compress/svd/scan', {
+      method: 'POST',
+      body: JSON.stringify({ model, modules: 'mlp,attn', energy_thresholds: [0.90, 0.95, 0.99] }),
+    });
+    renderCompressJobs();
+    _pollCompressJob(job_id, job => {
+      if (!job) { statusEl.textContent = 'Still running — check the jobs table below.'; return; }
+      if (job.status === 'error') {
+        statusEl.textContent = 'Error: ' + job.error;
+        statusEl.style.color = 'var(--danger)';
+        pushToast('SVD scan failed: ' + job.error, 'error');
+        return;
+      }
+      statusEl.textContent = `Done — ${job.result.matrices.length} matrices analyzed.`;
+      statusEl.style.color = 'var(--accent)';
+      renderSvdResults(job.result.matrices);
+      pushToast('SVD analysis complete', 'success');
+    });
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
+function renderSvdResults(matrices) {
+  const el = document.getElementById('svd-results');
+  if (!matrices || matrices.length === 0) {
+    el.innerHTML = '<div class="empty-state-hint">No matrices found.</div>';
+    return;
+  }
+  let html = '<div class="table-wrap"><table><thead><tr><th>Param</th><th>Shape</th><th>Rank@90%</th><th>Rank@95%</th><th>Rank@99%</th></tr></thead><tbody>';
+  matrices.forEach(m => {
+    const r = m.rank_at_energy;
+    html += `<tr><td>${escapeHtml(m.param_name)}</td><td>${m.shape[0]}x${m.shape[1]}</td>` +
+      `<td>${r['0.9'] ?? '-'}</td><td>${r['0.95'] ?? '-'}</td><td>${r['0.99'] ?? '-'}</td></tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+async function runSvdApply() {
+  const model = _requireCompressModel();
+  if (!model) return;
+  const outputDir = document.getElementById('svd-outputdir').value.trim();
+  if (!outputDir) {
+    alert('Set an output directory first — Apply writes a new checkpoint there.');
+    return;
+  }
+  const mode = document.getElementById('svd-mode').value;
+  if (!confirm(`This will write a new ${mode} checkpoint to "${outputDir}". Continue?`)) return;
+
+  const statusEl = document.getElementById('svd-status');
+  statusEl.textContent = `Applying SVD (${mode})...`;
+  try {
+    const { job_id } = await api('/api/compress/svd/apply', {
+      method: 'POST',
+      body: JSON.stringify({
+        model,
+        modules: 'mlp,attn',
+        rank_at_energy: parseFloat(document.getElementById('svd-energy').value),
+        mode,
+        output_dir: outputDir,
+      }),
+    });
+    renderCompressJobs();
+    _pollCompressJob(job_id, job => {
+      if (!job) { statusEl.textContent = 'Still running — check the jobs table below.'; return; }
+      if (job.status === 'error') {
+        statusEl.textContent = 'Error: ' + job.error;
+        statusEl.style.color = 'var(--danger)';
+        pushToast('SVD apply failed: ' + job.error, 'error');
+        return;
+      }
+      statusEl.textContent = `Wrote ${mode} checkpoint to ${job.result.output_dir}.` +
+        (mode === 'factorize' ? ' See svd_manifest.json — needs custom loading code.' : '');
+      statusEl.style.color = 'var(--accent)';
+      pushToast('SVD ' + mode + ' applied: ' + job.result.output_dir, 'success');
+    });
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
+// --- Distillation config generator ---
+
+async function runDistillConfig() {
+  const student = document.getElementById('distill-student').value.trim();
+  const teacher = document.getElementById('distill-teacher').value.trim();
+  if (!student || !teacher) {
+    alert('Set both student and teacher model paths.');
+    return;
+  }
+  const statusEl = document.getElementById('distill-status');
+  statusEl.textContent = 'Generating...';
+  try {
+    const result = await api('/api/compress/distill-config', {
+      method: 'POST',
+      body: JSON.stringify({
+        student, teacher,
+        mode: document.getElementById('distill-mode').value,
+      }),
+    });
+    statusEl.textContent = 'Generated.';
+    statusEl.style.color = 'var(--accent)';
+    const el = document.getElementById('distill-result');
+    el.innerHTML =
+      '<div class="code-block" style="white-space:pre-wrap;max-height:300px;overflow:auto"></div>' +
+      '<button class="btn btn-sm" style="margin-top:0.5rem" onclick="_openDistillInTraining()">Open in New Training</button>';
+    el.querySelector('.code-block').textContent = result.yaml;
+    window._lastDistillYaml = result.yaml;
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
+function _openDistillInTraining() {
+  navigate('training');
+  // config-editor is only guaranteed to exist once loadTrainingPage()
+  // finishes rendering — give it a beat rather than racing it.
+  setTimeout(() => {
+    const editor = document.getElementById('config-editor');
+    if (editor && window._lastDistillYaml) editor.value = window._lastDistillYaml;
+  }, 300);
 }
 
 async function renderCompressJobs() {
@@ -1479,6 +1754,54 @@ async function renderCompressJobs() {
   html += '</tbody></table></div>';
   el.innerHTML = html;
 }
+
+// --- Toast notifications (global — job completion is visible even if
+// you've navigated to a different page since starting it) ---
+
+function pushToast(message, type = 'info') {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const colors = { success: 'var(--accent)', error: 'var(--danger)', info: 'var(--text-dim)' };
+  const toast = document.createElement('div');
+  toast.className = 'card';
+  toast.style.cssText = `padding:0.6rem 1rem;border-left:3px solid ${colors[type] || colors.info};` +
+    'box-shadow:0 4px 12px rgba(0,0,0,0.3);max-width:320px;font-size:0.85rem;animation:none';
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.4s'; }, 5000);
+  setTimeout(() => toast.remove(), 5400);
+}
+
+// Tracks job ids we've already shown a toast for, so a job sitting in
+// "done" state across multiple poll ticks doesn't re-notify every tick.
+const _notifiedJobIds = new Set();
+
+async function _globalJobWatcherTick() {
+  try {
+    const [hf, compress] = await Promise.all([
+      api('/api/hf/download/jobs').catch(() => ({ jobs: [] })),
+      api('/api/compress/jobs').catch(() => ({ jobs: [] })),
+    ]);
+    const allJobs = [
+      ...(hf.jobs || []).map(j => ({ ...j, _kind: 'download', _label: j.repo_id })),
+      ...(compress.jobs || []).map(j => ({ ...j, _kind: j.kind, _label: j.model || j.output_dir || '' })),
+    ];
+    for (const j of allJobs) {
+      const terminal = j.status === 'done' || j.status === 'error';
+      if (!terminal || _notifiedJobIds.has(j.job_id)) continue;
+      _notifiedJobIds.add(j.job_id);
+      if (j.status === 'done') {
+        pushToast(`${j._kind} finished: ${j._label}`, 'success');
+      } else {
+        pushToast(`${j._kind} failed: ${j._label} — ${j.error || ''}`, 'error');
+      }
+    }
+  } catch (err) {
+    // silent — this is a background convenience, not critical path
+  }
+}
+
+setInterval(_globalJobWatcherTick, 4000);
 
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {

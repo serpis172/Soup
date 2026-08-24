@@ -54,6 +54,7 @@
           <h1 class="page-title">Dashboard</h1>
           <button class="btn" onclick="loadDashboard()">Refresh</button>
         </div>
+        <div id="health-banner"></div>
         <div id="dashboard-content">
           <div style="text-align:center;padding:3rem;color:var(--text-dim)">Loading...</div>
         </div>
@@ -106,6 +107,7 @@
           </div>
           <button class="btn btn-primary btn-sm" onclick="applyStreamingSettings()">Apply to config</button>
           <span id="streaming-settings-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="config-diff" style="margin-top:0.5rem"></div>
         </div>
         <!-- Training Progress Bar -->
         <div id="train-progress" class="card" style="display:none">
@@ -313,8 +315,8 @@
         </div>
 
         <div class="card">
-          <div class="card-title">Neuron importance (weight-magnitude ranking)</div>
-          <div class="grid-2">
+          <div class="card-title">Neuron importance</div>
+          <div class="grid-3">
             <div class="form-group">
               <label class="form-label">Modules</label>
               <select id="importance-modules">
@@ -328,6 +330,17 @@
               <label class="form-label">Bottom-K per layer</label>
               <input type="number" id="importance-bottomk" value="10" min="1" max="200">
             </div>
+            <div class="form-group">
+              <label class="form-label">Metric</label>
+              <select id="importance-metric" onchange="onImportanceMetricChange()">
+                <option value="magnitude">Magnitude (fast, streamed, no data)</option>
+                <option value="wanda">Wanda (activation-weighted, needs calibration text)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group" id="importance-calib-group" style="display:none">
+            <label class="form-label">Calibration text (one sample per line)</label>
+            <textarea id="importance-calib-text" rows="4" placeholder="A few sentences representative of your domain — 10-50 lines is usually enough."></textarea>
           </div>
           <button class="btn btn-primary btn-sm" onclick="runImportanceScan()">Scan importance</button>
           <span id="importance-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
@@ -357,14 +370,90 @@
               <input type="text" id="merge-outputdir" placeholder="e.g. ./output/merged-model">
             </div>
           </div>
-          <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:var(--text-dim);margin-bottom:0.75rem">
+          <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:var(--text-dim);margin-bottom:0.5rem">
             <input type="checkbox" id="merge-allow-nonuniform">
             Allow non-uniform intermediate_size (writes a checkpoint stock <code>transformers</code> can't load — advanced/custom deployments only)
           </label>
+          <div class="form-group">
+            <label class="form-label" style="display:flex;align-items:center;gap:0.4rem">
+              <input type="checkbox" id="merge-eval-enable" onchange="document.getElementById('merge-eval-group').style.display=this.checked?'':'none'">
+              Quick eval: compare perplexity before/after on Apply (loads both models — slower)
+            </label>
+            <div id="merge-eval-group" style="display:none;margin-top:0.4rem">
+              <textarea id="merge-eval-text" rows="3" placeholder="A few evaluation sentences, one per line."></textarea>
+            </div>
+          </div>
           <button class="btn btn-primary btn-sm" onclick="runNeuronScan()">Find candidates</button>
           <button class="btn btn-danger btn-sm" onclick="runNeuronApply()">Apply merge</button>
           <span id="merge-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
           <div id="merge-results" style="margin-top:1rem"></div>
+          <div id="merge-eval-result" style="margin-top:0.5rem"></div>
+          <div id="merge-distill-suggest" style="margin-top:0.75rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">SVD weight compression</div>
+          <div class="empty-state-hint" style="margin-bottom:0.5rem">
+            <strong>Denoise</strong>: replaces a matrix with its best low-rank reconstruction at the
+            <em>same shape</em> — never breaks compatibility, doesn't shrink the file, removes
+            low-signal noise. <strong>Factorize</strong>: splits a matrix into two smaller ones —
+            genuine size reduction, but the result needs custom loading code (a
+            <code>svd_manifest.json</code> documents exactly how).
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Mode</label>
+              <select id="svd-mode">
+                <option value="denoise">Denoise (safe, same shape)</option>
+                <option value="factorize">Factorize (smaller, custom loading needed)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Rank at energy retention</label>
+              <select id="svd-energy">
+                <option value="0.90">90%</option>
+                <option value="0.95" selected>95%</option>
+                <option value="0.99">99%</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Output directory (for Apply)</label>
+              <input type="text" id="svd-outputdir" placeholder="e.g. ./output/svd-model">
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runSvdScan()">Analyze</button>
+          <button class="btn btn-danger btn-sm" onclick="runSvdApply()">Apply</button>
+          <span id="svd-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="svd-results" style="margin-top:1rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Distillation recovery</div>
+          <div class="empty-state-hint" style="margin-bottom:0.5rem">
+            Generates a config for the existing distillation trainer (<code>task: distill</code>) —
+            teacher/student KL distillation, already fully implemented. This just pre-fills it:
+            student = your compressed model, teacher = the original.
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Student (compressed model path)</label>
+              <input type="text" id="distill-student" placeholder="e.g. ./output/merged-model">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Teacher</label>
+              <input type="text" id="distill-teacher" placeholder="original model path or HF id">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Mode</label>
+              <select id="distill-mode">
+                <option value="token">Token-level KL</option>
+                <option value="sequence">Sequence-level (teacher-generated)</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runDistillConfig()">Generate config</button>
+          <span id="distill-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="distill-result" style="margin-top:0.75rem"></div>
         </div>
 
         <div class="card">
@@ -377,6 +466,11 @@
 
     </main>
   </div>
+
+  <!-- Toast notifications: shown when a background job (HF download,
+       compress scan/apply) finishes, even if you've navigated to another
+       page in the meantime. -->
+  <div id="toast-container" style="position:fixed;bottom:1rem;right:1rem;z-index:999;display:flex;flex-direction:column;gap:0.5rem"></div>
 
   <!-- Run Detail Modal -->
   <div class="modal-overlay" id="run-modal" onclick="if(event.target===this)closeModal()">

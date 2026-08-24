@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field
@@ -872,6 +872,79 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         except ImportError:
             return {"total_gb": None, "available_gb": None, "safe_max_gb": None}
 
+    # --- Lightweight health banner for the Dashboard ---
+    # Deliberately independent of `soup doctor` (commands/doctor.py) rather
+    # than reusing its checks: those print Rich Panels directly instead of
+    # returning structured data, so wiring them into a JSON endpoint would
+    # mean refactoring a mature, already-relied-upon CLI command — not
+    # worth the risk for a banner. `soup doctor` remains the authoritative,
+    # detailed check; this is a few fast, safe signals for "is anything
+    # obviously wrong before you start a run".
+
+    @app.get("/api/system/health")
+    def system_health():
+        issues = []
+        try:
+            import torch
+
+            if not torch.cuda.is_available() and not (
+                hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            ):
+                issues.append("No GPU detected (CPU-only) — training will be slow.")
+        except ImportError:
+            issues.append("PyTorch not installed — run: pip install -e \".[train]\"")
+
+        try:
+            import shutil
+
+            free_gb = shutil.disk_usage(".").free / (1024**3)
+            if free_gb < 10:
+                issues.append(f"Low disk space: {free_gb:.1f} GB free in the working directory.")
+        except OSError:
+            pass
+
+        try:
+            import psutil
+
+            if psutil.virtual_memory().available / (1024**3) < 4:
+                issues.append("Less than 4 GB RAM available.")
+        except ImportError:
+            pass
+
+        return {"ok": len(issues) == 0, "issues": issues}
+
+    # --- Live resource snapshot (Dashboard polls this every few seconds) ---
+
+    @app.get("/api/system/live")
+    def system_live():
+        snapshot: Dict[str, Any] = {"cpu_pct": None, "ram_pct": None, "gpu": []}
+        try:
+            import psutil
+
+            snapshot["cpu_pct"] = psutil.cpu_percent(interval=None)
+            snapshot["ram_pct"] = psutil.virtual_memory().percent
+        except ImportError:
+            pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                for idx in range(torch.cuda.device_count()):
+                    total = torch.cuda.get_device_properties(idx).total_memory
+                    reserved = torch.cuda.memory_reserved(idx)
+                    snapshot["gpu"].append(
+                        {
+                            "index": idx,
+                            "name": torch.cuda.get_device_name(idx),
+                            "memory_used_gb": round(reserved / (1024**3), 2),
+                            "memory_total_gb": round(total / (1024**3), 2),
+                            "memory_pct": round(100 * reserved / total, 1) if total else 0,
+                        }
+                    )
+        except ImportError:
+            pass
+        return snapshot
+
     # --- Streaming / quantization config patch ---
 
     class TrainingPatchRequest(PydanticBaseModel):
@@ -1158,14 +1231,27 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         model: str
         modules: str = "mlp,attn"
         bottom_k: int = Field(default=10, ge=1, le=200)
+        metric: str = "magnitude"  # "magnitude" | "wanda"
+        calibration_texts: Optional[List[str]] = None
+        max_length: int = Field(default=512, ge=16, le=4096)
 
     def _run_importance_scan(job_id: str, req: "ImportanceScanRequest"):
         try:
-            from soup_cli.utils.neuron_compress import rank_importance
-            from soup_cli.utils.spectrum_scan import resolve_model_weights
+            if req.metric == "wanda":
+                if not req.calibration_texts:
+                    raise ValueError("metric=wanda requires calibration_texts")
+                from soup_cli.utils.neuron_compress import rank_importance_wanda
 
-            weights_dir = resolve_model_weights(req.model)
-            results = rank_importance(weights_dir, modules=req.modules)
+                results = rank_importance_wanda(
+                    req.model, req.calibration_texts, modules=req.modules, max_length=req.max_length
+                )
+            else:
+                from soup_cli.utils.neuron_compress import rank_importance
+                from soup_cli.utils.spectrum_scan import resolve_model_weights
+
+                weights_dir = resolve_model_weights(req.model)
+                results = rank_importance(weights_dir, modules=req.modules)
+
             payload = [
                 {
                     "param_name": r.param_name,
@@ -1178,7 +1264,7 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
                 }
                 for r in results
             ]
-            _finish_compress_job(job_id, result={"layers": payload})
+            _finish_compress_job(job_id, result={"layers": payload, "metric": req.metric})
         except Exception as exc:  # background thread — never let this die silently
             _finish_compress_job(job_id, error=f"{type(exc).__name__}: {exc}")
 
@@ -1235,6 +1321,7 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         max_pairs_per_layer: int = Field(default=50, ge=1, le=1000)
         output_dir: str
         allow_nonuniform: bool = False
+        eval_texts: Optional[List[str]] = None
 
     def _run_neuron_apply(job_id: str, req: "NeuronApplyRequest", target_dir: str):
         try:
@@ -1251,16 +1338,18 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             summary = apply_merges_to_checkpoint(
                 weights_dir, target_dir, candidates, allow_nonuniform=req.allow_nonuniform
             )
-            _finish_compress_job(
-                job_id,
-                result={
-                    "output_dir": target_dir,
-                    "layers": [
-                        {"layer_idx": idx, "before": before, "after": after}
-                        for idx, before, after in summary
-                    ],
-                },
-            )
+            result = {
+                "output_dir": target_dir,
+                "layers": [
+                    {"layer_idx": idx, "before": before, "after": after}
+                    for idx, before, after in summary
+                ],
+            }
+            if req.eval_texts:
+                from soup_cli.utils.neuron_compress import quick_eval_merge
+
+                result["quick_eval"] = quick_eval_merge(req.model, target_dir, req.eval_texts)
+            _finish_compress_job(job_id, result=result)
         except Exception as exc:
             _finish_compress_job(job_id, error=f"{type(exc).__name__}: {exc}")
 
@@ -1288,5 +1377,110 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
                     _compress_jobs.values(), key=lambda j: j["started_ts"], reverse=True
                 )
             }
+
+    # --- SVD compression ---
+
+    class SvdScanRequest(PydanticBaseModel):
+        model: str
+        modules: str = "mlp,attn"
+        energy_thresholds: List[float] = Field(default_factory=lambda: [0.90, 0.95, 0.99])
+
+    def _run_svd_scan(job_id: str, req: "SvdScanRequest"):
+        try:
+            from soup_cli.utils.spectrum_scan import resolve_model_weights
+            from soup_cli.utils.svd_compress import analyze_svd
+
+            weights_dir = resolve_model_weights(req.model)
+            analysis = analyze_svd(
+                weights_dir, modules=req.modules, energy_thresholds=tuple(req.energy_thresholds)
+            )
+            payload = [
+                {
+                    "param_name": a.param_name,
+                    "group": a.group,
+                    "module_type": a.module_type,
+                    "shape": list(a.shape),
+                    "rank_at_energy": {str(k): v for k, v in a.rank_at_energy.items()},
+                }
+                for a in analysis
+            ]
+            _finish_compress_job(job_id, result={"matrices": payload})
+        except Exception as exc:
+            _finish_compress_job(job_id, error=f"{type(exc).__name__}: {exc}")
+
+    @app.post("/api/compress/svd/scan", dependencies=[Depends(_verify_token)])
+    def compress_svd_scan(req: SvdScanRequest):
+        job_id = _new_compress_job("svd_scan", {"model": req.model})
+        threading.Thread(target=_run_svd_scan, args=(job_id, req), daemon=True).start()
+        return {"job_id": job_id}
+
+    class SvdApplyRequest(PydanticBaseModel):
+        model: str
+        modules: str = "mlp,attn"
+        rank_at_energy: float = Field(default=0.95, ge=0.0, le=1.0)
+        mode: str = "denoise"  # "denoise" | "factorize"
+        output_dir: str
+
+    def _run_svd_apply(job_id: str, req: "SvdApplyRequest", target_dir: str):
+        try:
+            from soup_cli.utils.spectrum_scan import resolve_model_weights
+            from soup_cli.utils.svd_compress import analyze_svd, apply_svd_to_checkpoint
+
+            weights_dir = resolve_model_weights(req.model)
+            analysis = analyze_svd(
+                weights_dir, modules=req.modules, energy_thresholds=(req.rank_at_energy,)
+            )
+            plan = {a.param_name: a.rank_at_energy[req.rank_at_energy] for a in analysis}
+            report = apply_svd_to_checkpoint(weights_dir, target_dir, plan, mode=req.mode)
+            _finish_compress_job(
+                job_id, result={"output_dir": target_dir, "matrices": report, "mode": req.mode}
+            )
+        except Exception as exc:
+            _finish_compress_job(job_id, error=f"{type(exc).__name__}: {exc}")
+
+    @app.post("/api/compress/svd/apply", dependencies=[Depends(_verify_token)])
+    def compress_svd_apply(req: SvdApplyRequest):
+        from soup_cli.utils.paths import is_under_cwd
+
+        if req.mode not in ("denoise", "factorize"):
+            raise HTTPException(status_code=400, detail="mode must be 'denoise' or 'factorize'")
+        if not is_under_cwd(req.output_dir):
+            raise HTTPException(
+                status_code=403, detail="output_dir must stay inside the working directory"
+            )
+        job_id = _new_compress_job(
+            "svd_apply", {"model": req.model, "output_dir": req.output_dir}
+        )
+        threading.Thread(
+            target=_run_svd_apply, args=(job_id, req, req.output_dir), daemon=True
+        ).start()
+        return {"job_id": job_id}
+
+    # --- Distillation config bridge (see commands/compress.py::distill_config
+    # for the same generator, exposed here for the UI's "Distill" button —
+    # reuses the *existing*, already-integrated distillation trainer via
+    # `task: distill`, this only generates the config text) ---
+
+    class DistillConfigRequest(PydanticBaseModel):
+        student: str
+        teacher: str
+        data_train: Optional[str] = None
+        mode: str = "token"
+        divergence: str = "forward_kl"
+
+    @app.post("/api/compress/distill-config", dependencies=[Depends(_verify_token)])
+    def compress_distill_config(req: DistillConfigRequest):
+        from soup_cli.commands.compress import build_distill_config_yaml
+
+        if req.mode not in ("token", "sequence"):
+            raise HTTPException(status_code=400, detail="mode must be 'token' or 'sequence'")
+        yaml_text = build_distill_config_yaml(
+            student_base=req.student,
+            teacher_model=req.teacher,
+            data_train=req.data_train,
+            mode=req.mode,
+            divergence=req.divergence,
+        )
+        return {"yaml": yaml_text}
 
     return app
