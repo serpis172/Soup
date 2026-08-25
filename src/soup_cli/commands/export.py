@@ -844,27 +844,19 @@ def _validate_calibration_path(calibration_data: Optional[str]) -> Optional[Path
 
 
 def _load_calibration_texts(cal_path: Optional[Path], max_samples: int = 128) -> list:
-    """Load calibration texts from JSONL file."""
+    """Load calibration texts from a JSONL file.
+
+    Thin wrapper around `neuron_compress.load_calibration_texts` (the
+    shared, multi-file-capable loader) so this call site, `soup compress
+    importance --metric wanda`, and the UI's Wanda scan endpoint all read
+    calibration JSONL the same way instead of three slightly-different
+    copies of the same loop.
+    """
     if cal_path is None:
         return []
-    texts = []
-    with open(cal_path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                # Support "text" field or concatenate all string values
-                if "text" in row:
-                    texts.append(str(row["text"]))
-                else:
-                    texts.append(" ".join(str(v) for v in row.values() if v))
-            except json.JSONDecodeError:
-                continue
-            if len(texts) >= max_samples:
-                break
-    return texts
+    from soup_cli.utils.neuron_compress import load_calibration_texts
+
+    return load_calibration_texts(str(cal_path), max_samples_per_file=max_samples)
 
 
 def _export_awq(
@@ -878,11 +870,16 @@ def _export_awq(
     trust_remote_code: bool = False,
 ) -> None:
     """Export model to AWQ format via autoawq."""
-    # Validate bits
-    valid_bits = {4, 8}
+    # Validate bits. AWQ is 4-bit-only in every mainstream implementation
+    # (autoawq's activation-aware scale search is defined for a 4-bit grid) —
+    # this previously accepted 8 here and only failed later, inside
+    # quant_menu.build_awq_config, with a much less actionable error.
+    valid_bits = {4}
     if bits not in valid_bits:
         console.print(
-            f"[red]Invalid --bits {bits}. Must be one of: {sorted(valid_bits)}[/]"
+            f"[red]Invalid --bits {bits} for AWQ. AWQ only supports 4-bit "
+            f"(library limitation, not Soup's). Use --format gptq for "
+            f"2/3/4/8-bit, or gguf for k-quants/i-quants.[/]"
         )
         raise typer.Exit(1)
 
@@ -1010,8 +1007,11 @@ def _export_gptq(
     trust_remote_code: bool = False,
 ) -> None:
     """Export model to GPTQ format via auto-gptq."""
-    # Validate bits
-    valid_bits = {4, 8}
+    # Validate bits. auto-gptq/GPTQModel support 2/3/4/8-bit quantization —
+    # this now matches soup_cli.utils.quant_menu.build_gptq_config's own
+    # domain, which already accepted 2/3 while this CLI-level check silently
+    # rejected them first.
+    valid_bits = {2, 3, 4, 8}
     if bits not in valid_bits:
         console.print(
             f"[red]Invalid --bits {bits}. Must be one of: {sorted(valid_bits)}[/]"

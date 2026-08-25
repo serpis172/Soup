@@ -213,47 +213,76 @@ def load_dataset(data_config: DataConfig) -> dict:
     - Local files (.jsonl, .json, .csv, .parquet, .txt)
     - HuggingFace dataset names (auto-detected if no file extension)
     - Remote fsspec URIs (s3://, gs://, gcs://, az://, abfs://, abfss://, oci://) — v0.53.8 #85
+    - More than one source for `train` and/or `val` (this session): either
+      field accepts a single path/URI/HF-name OR a list of them. Each source
+      is loaded, format-detected, and formatted independently (mirrors
+      `_load_replay_rows`'s own-format-detection reasoning: two datasets
+      merged into one training run are not guaranteed to share a format),
+      then concatenated in the order given.
     """
-    train_path = data_config.train
+    train_sources = _as_source_list(data_config.train)
+    train_formatted: list[dict] = []
+    for src in train_sources:
+        train_formatted.extend(_load_and_format_source(src, data_config))
 
-    # v0.53.8 #85 — fsspec live remote loader. Schema accepts these URIs
-    # since v0.42.0; live loader lands here. Lazy-imports fsspec + the
-    # backend driver (s3fs / gcsfs / adlfs / ocifs) and surfaces a
-    # friendly Rich panel naming the pip install when the driver is
-    # missing.
-    if _looks_like_remote_uri(train_path):
-        return _load_remote_dataset(train_path, data_config)
+    # Explicit validation set(s), if configured. When absent, behaviour is
+    # unchanged: `_finalize` carves val out of train via `val_split`, exactly
+    # as before this field existed.
+    val_formatted: list[dict] | None = None
+    if getattr(data_config, "val", None):
+        val_formatted = []
+        for src in _as_source_list(data_config.val):
+            val_formatted.extend(_load_and_format_source(src, data_config))
 
-    # Check if it's a HuggingFace dataset
-    if not Path(train_path).suffix:
-        return _load_hf_dataset(train_path, data_config)
+    return _finalize(train_formatted, data_config, val=val_formatted)
 
-    # Local file
-    path = Path(train_path)
+
+def _as_source_list(value: "str | list[str]") -> list[str]:
+    """Normalize a `train`/`val`/`calibration` config value (single string or
+    list) to a list, so every call site handles one shape."""
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def _load_and_format_source(source: str, data_config: DataConfig) -> list[dict]:
+    """Load and format ONE data source (local file, HF dataset name, or
+    remote fsspec URI) into the standard message-list shape.
+
+    Factored out of `load_dataset` so train/val (and, via
+    `soup_cli.utils.calibration_data`, the pipeline's calibration stage) all
+    resolve a source the same way instead of three divergent copies.
+    """
+    if _looks_like_remote_uri(source):
+        loaded = _load_remote_dataset(source, data_config)
+        # `_load_remote_dataset` already returns formatted+finalized shape
+        # for the single-source case; when called per-source here we only
+        # want the formatted rows, pre-split, pre-replay.
+        return loaded.get("train", []) + loaded.get("val", [])
+
+    if not Path(source).suffix:
+        loaded = _load_hf_dataset(source, data_config)
+        return loaded.get("train", []) + loaded.get("val", [])
+
+    path = Path(source)
     raw_data = load_raw_data(path)
 
-    # Detect or use specified format
     fmt = data_config.format
     if fmt == "auto":
         fmt = detect_format(raw_data)
-        console.print(f"[dim]Auto-detected format: {fmt}[/]")
+        console.print(f"[dim]Auto-detected format for {source}: {fmt}[/]")
 
-    # Convert to standard message format
     formatted = [format_to_messages(row, fmt) for row in raw_data]
-    formatted = [r for r in formatted if r is not None]  # filter failed rows
+    formatted = [r for r in formatted if r is not None]
 
-    # Validate image paths for vision formats
     if is_vision_format(fmt):
         image_dir = Path(data_config.image_dir) if data_config.image_dir else path.parent
         formatted = _validate_vision_images(formatted, image_dir)
-
-    # Validate audio paths for audio formats
     if is_audio_format(fmt):
         audio_dir = Path(data_config.audio_dir) if data_config.audio_dir else path.parent
         formatted = _validate_audio_files(formatted, audio_dir)
 
-    # Split into train/val, then mix replay into train (v0.71.36).
-    return _finalize(formatted, data_config)
+    return formatted
 
 
 def _validate_vision_images(data: list[dict], image_dir: Path) -> list[dict]:

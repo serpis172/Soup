@@ -354,7 +354,48 @@ class TestGptqExportFunction:
                 assert "my_model_gptq" in output_path
 
     def test_export_gptq_invalid_bits(self, tmp_path):
-        """Invalid bits value should raise ClickExit."""
+        """Invalid bits value should raise ClickExit.
+
+        bits=3 used to be the invalid case here, back when GPTQ export was
+        artificially capped at {4, 8}. auto-gptq/GPTQModel genuinely support
+        2/3-bit quantization (soup_cli.utils.quant_menu.build_gptq_config
+        already accepted them), so the cap was widened to {2, 3, 4, 8} —
+        this test now exercises a bit width nothing supports instead.
+        """
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+
+        import soup_cli.commands.export as export_mod
+
+        with pytest.raises(ClickExit):
+            export_mod._export_gptq(
+                model_dir, None, None, bits=5, group_size=128,
+                calibration_data=None,
+            )
+
+    def test_export_gptq_accepts_2bit(self, tmp_path, capsys):
+        """2-bit GPTQ is a genuinely supported configuration (new in this
+        session) — bits=2 must get past the `valid_bits` check without
+        raising there. It still fails past validation without auto-gptq
+        installed, so we assert on the printed message to distinguish
+        "rejected at bits validation" from "failed later for an unrelated
+        reason" rather than relying on ClickExit alone.
+        """
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+
+        import soup_cli.commands.export as export_mod
+
+        with pytest.raises(ClickExit):
+            export_mod._export_gptq(
+                model_dir, None, None, bits=2, group_size=128,
+                calibration_data=None,
+            )
+        out = capsys.readouterr().out.lower()
+        assert "invalid --bits" not in out
+
+    def test_export_gptq_accepts_3bit(self, tmp_path, capsys):
+        """3-bit GPTQ is likewise now accepted at the validation stage."""
         model_dir = tmp_path / "model"
         model_dir.mkdir()
 
@@ -365,6 +406,26 @@ class TestGptqExportFunction:
                 model_dir, None, None, bits=3, group_size=128,
                 calibration_data=None,
             )
+        out = capsys.readouterr().out.lower()
+        assert "invalid --bits" not in out
+
+    def test_export_awq_rejects_8bit(self, tmp_path, capsys):
+        """AWQ is 4-bit-only (autoawq library limitation, not Soup's) — this
+        used to be silently accepted here and only fail later, deep inside
+        quant_menu.build_awq_config, with a much less actionable error.
+        """
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+
+        import soup_cli.commands.export as export_mod
+
+        with pytest.raises(ClickExit):
+            export_mod._export_awq(
+                model_dir, None, None, bits=8, group_size=128,
+                calibration_data=None,
+            )
+        out = capsys.readouterr().out.lower()
+        assert "invalid --bits" in out
 
     def test_export_gptq_calibration_path_traversal(self, tmp_path):
         """Calibration data path should be confined to cwd."""

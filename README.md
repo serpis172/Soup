@@ -21,6 +21,19 @@
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 License">
 </p>
 
+> **This is a fork** of [MakazhanAlpamys/Soup](https://github.com/MakazhanAlpamys/Soup) —
+> all credit for the original design, the layer-streaming approach, and the core CLI goes
+> to the upstream project and its contributors. This fork adds a Web UI, RAM-prefetch
+> streaming, additional quantization strategies (AWQ/GPTQ/k-quants/i-quants), an optional
+> compression pipeline (activation scan → merge/SVD compress → distill, all opt-in and
+> declared in the training YAML), multi-dataset training/validation/calibration support,
+> and a pre-training data-verification gate. See [`README-FORK.md`](README-FORK.md) for the
+> full list of fork-specific changes and how they map onto upstream, and please direct
+> anything not specific to this fork's own changes (bug reports against core training
+> behavior, feature requests unrelated to the items above) to the
+> [upstream repository](https://github.com/MakazhanAlpamys/Soup) instead — this fork tracks
+> upstream but isn't a substitute for it.
+
 ---
 
 Soup turns the pain of LLM fine-tuning into a simple workflow. One config, one command, done.
@@ -29,8 +42,8 @@ ranking, similar-neuron merging, SVD compression, a bridge into distillation) on
 core CLI — all opt-in, all covered below.
 
 ```bash
-git clone <this-repository-url>
-cd soup
+git clone https://github.com/serpis172/Soup.git
+cd Soup
 pip install -e ".[train]"   # add [train] to fine-tune; bare -e "." is the light CLI
 soup init --template chat
 soup train

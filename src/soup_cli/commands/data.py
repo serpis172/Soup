@@ -23,6 +23,70 @@ console = Console()
 app = typer.Typer(no_args_is_help=True)
 
 
+def verify_dataset_sources(
+    sources: "list[str]",
+    label: str,
+    *,
+    console: Console = console,
+) -> None:
+    """Run the same checks as `soup data inspect` against every LOCAL path
+    in `sources`, printing a compact summary table per file. Raises
+    `ValueError` on a hard failure (missing file, zero usable rows, or a
+    completely degenerate file — 100% duplicate or 100% empty) so the
+    caller can abort before allocating a model/optimizer for data that was
+    never going to train.
+
+    HF dataset names and remote fsspec URIs are skipped — there's nothing
+    local to inspect — and reported as skipped rather than silently passed,
+    so a typo'd source doesn't look identically "verified" to a real one.
+
+    Used by `soup train`'s pre-flight gate (data.verify_before_training,
+    default True) for train/val/calibration sources alike; label is
+    "train" / "val" / "calibration" purely for the printed output.
+    """
+    from soup_cli.data.loader import _looks_like_remote_uri
+
+    for source in sources:
+        if _looks_like_remote_uri(source) or not Path(source).suffix:
+            console.print(
+                f"[dim]  {label}: {source} — remote/HF source, skipping local inspection[/]"
+            )
+            continue
+
+        file_path = Path(source)
+        if not file_path.exists():
+            raise ValueError(f"{label} dataset not found: {source}")
+
+        data = load_raw_data(file_path)
+        result = validate_and_stats(data)
+
+        if result["total"] == 0:
+            raise ValueError(f"{label} dataset has zero usable rows: {source}")
+        # validate_and_stats' "duplicates" is total-minus-unique (v.py:
+        # `dup_count = len(row_strs) - len(set(row_strs))`), so a fully
+        # degenerate file (every row identical) reports duplicates ==
+        # total - 1, not total. Comparing against "how many unique rows
+        # remain" catches that case correctly for any total >= 2 — the
+        # first `>= total` comparison this used to be a no-op bug that
+        # never fired.
+        unique_rows = result["total"] - result["duplicates"]
+        if unique_rows <= 1 and result["total"] > 1:
+            raise ValueError(
+                f"{label} dataset has only {unique_rows} unique row across "
+                f"{result['total']} total: {source} — looks like a generation "
+                f"bug, not real data"
+            )
+
+        table = Table(title=f"{label}: {file_path.name}", show_header=True)
+        table.add_column("Metric", style="bold")
+        table.add_column("Value")
+        table.add_row("Samples", str(result["total"]))
+        table.add_row("Avg length (chars)", str(result["avg_length"]))
+        table.add_row("Empty fields", str(result["empty_fields"]))
+        table.add_row("Duplicates", str(result["duplicates"]))
+        console.print(table)
+
+
 @app.command()
 def inspect(
     path: str = typer.Argument(..., help="Path to dataset file (jsonl, csv, parquet)"),

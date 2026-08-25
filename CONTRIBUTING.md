@@ -1,5 +1,16 @@
 # Contributing to Soup
 
+> **Fork notice:** this is a fork of [MakazhanAlpamys/Soup](https://github.com/MakazhanAlpamys/Soup)
+> ([README-FORK.md](README-FORK.md) lists what's different here). Two kinds of contribution:
+>
+> - **Fixes/features specific to this fork's own additions** (Web UI, RAM prefetch,
+>   `training.pipeline`, `training.objectives`, multi-dataset loading, the widened
+>   quantization bit-width options) — PRs welcome here, against `serpis172/Soup`.
+> - **Fixes to core behavior this fork inherited unchanged from upstream** — please send
+>   those to [upstream](https://github.com/MakazhanAlpamys/Soup) instead, so every fork
+>   benefits, not just this one. If you're unsure which bucket a change falls in, open an
+>   issue here first and we'll help route it.
+
 Thank you for your interest in contributing to Soup! We welcome bug reports, feature requests, and pull requests from the community.
 
 ## Getting Started
@@ -7,7 +18,7 @@ Thank you for your interest in contributing to Soup! We welcome bug reports, fea
 ### 1. Fork & Clone
 
 ```bash
-git clone https://github.com/MakazhanAlpamys/Soup.git
+git clone https://github.com/serpis172/Soup.git
 cd Soup
 ```
 

@@ -524,6 +524,36 @@ def train(
     console.print(f"[dim]Loading config from {config_path}...[/]")
     cfg = load_config(config_path)
 
+    # --- Pre-flight dataset verification (this session) ---
+    # "voglio che i dataset di training, validazione e calibrazione siano
+    # verificati tramite il tool di soup 'soup data inspect', prima di
+    # iniziare il training" — runs the same checks `soup data inspect` runs,
+    # against every resolved train/val/calibration source, BEFORE the model
+    # and optimizer are allocated. data.verify_before_training=False skips
+    # this (e.g. CI runs against synthetic fixtures that intentionally
+    # don't look like real data).
+    if getattr(cfg.data, "verify_before_training", True):
+        from soup_cli.commands.data import verify_dataset_sources
+
+        def _as_list(v):
+            if v is None:
+                return []
+            return [v] if isinstance(v, str) else list(v)
+
+        console.print("[dim]Verifying datasets (soup data inspect checks)...[/]")
+        try:
+            verify_dataset_sources(_as_list(cfg.data.train), "train", console=console)
+            verify_dataset_sources(_as_list(cfg.data.val), "val", console=console)
+            verify_dataset_sources(
+                _as_list(getattr(cfg.data, "calibration", None)), "calibration", console=console
+            )
+        except ValueError as exc:
+            console.print(f"[red]Dataset verification failed:[/] {markup_escape(str(exc))}")
+            console.print(
+                "[dim]Set data.verify_before_training: false to skip this check.[/]"
+            )
+            raise typer.Exit(code=1) from exc
+
     # --- v0.71.36 replay passthrough ---
     try:
         cfg = _apply_replay_overrides(

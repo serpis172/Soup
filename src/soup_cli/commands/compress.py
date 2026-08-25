@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from rich.console import Console
@@ -64,10 +64,15 @@ def importance(
             "alone misses, at the cost of a heavier scan."
         ),
     ),
-    calibration_data: Optional[str] = typer.Option(
+    calibration_data: Optional[List[str]] = typer.Option(
         None,
         "--calibration-data",
-        help="JSONL with a 'text' field per line, used only when --metric wanda.",
+        help=(
+            "JSONL with a 'text' field per line, used only when --metric wanda. "
+            "Repeatable — pass --calibration-data multiple times to draw the "
+            "calibration set from more than one dataset (e.g. code + chat + a "
+            "domain corpus); samples are pooled across all of them."
+        ),
     ),
     calibration_samples: int = typer.Option(
         64, "--calibration-samples", help="How many calibration lines to use (wanda only)."
@@ -94,7 +99,7 @@ def importance(
         console.print(f"[red]--metric must be 'magnitude' or 'wanda', got {metric!r}[/]")
         raise typer.Exit(2)
     if metric == "wanda" and not calibration_data:
-        console.print("[red]--metric wanda requires --calibration-data <file.jsonl>[/]")
+        console.print("[red]--metric wanda requires at least one --calibration-data <file.jsonl>[/]")
         raise typer.Exit(2)
 
     if output is not None:
@@ -108,26 +113,24 @@ def importance(
 
     try:
         if metric == "wanda":
-            import json as json_mod
+            from soup_cli.utils.neuron_compress import (
+                load_calibration_texts,
+                rank_importance_wanda,
+            )
 
-            from soup_cli.utils.neuron_compress import rank_importance_wanda
-
-            texts = []
-            with open(calibration_data, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    row = json_mod.loads(line)
-                    text = row.get("text") if isinstance(row, dict) else None
-                    if text:
-                        texts.append(text)
-                    if len(texts) >= calibration_samples:
-                        break
+            texts = load_calibration_texts(
+                calibration_data, max_samples_per_file=calibration_samples
+            )
             if not texts:
-                console.print(f"[red]No usable 'text' field found in {escape(calibration_data)}[/]")
+                sources = ", ".join(escape(p) for p in calibration_data)
+                console.print(f"[red]No usable 'text' field found in: {sources}[/]")
                 raise typer.Exit(1)
-            console.print(f"[dim]Loading {escape(model)} for Wanda scan ({len(texts)} calibration samples)...[/]")
+            n_sources = len(calibration_data)
+            source_note = f"{n_sources} dataset{'s' if n_sources != 1 else ''}"
+            console.print(
+                f"[dim]Loading {escape(model)} for Wanda scan "
+                f"({len(texts)} calibration samples from {source_note})...[/]"
+            )
             results = rank_importance_wanda(model, texts, modules=modules, max_length=max_length)
         else:
             from soup_cli.utils.neuron_compress import rank_importance

@@ -62,6 +62,7 @@ from soup_cli.commands import quantize as quantize_cmd  # noqa: E402
 from soup_cli.commands import quickstart as quickstart_cmd  # noqa: E402
 from soup_cli.commands import spectrum as spectrum_cmd  # noqa: E402
 from soup_cli.commands import compress as compress_cmd  # noqa: E402
+from soup_cli.commands import pipeline as pipeline_cmd  # noqa: E402
 from soup_cli.commands import (  # noqa: E402
     tui as tui_cmd,
 )
@@ -149,6 +150,10 @@ app.add_typer(
 app.add_typer(
     compress_cmd.app, name="compress",
     help="Optional model-density tools: neuron importance + similar-neuron merging (v0.73.6).",
+)
+app.add_typer(
+    pipeline_cmd.app, name="pipeline",
+    help="Run training.pipeline's activation_scan/compress/distill stages (this session).",
 )
 app.add_typer(
     can.app, name="can",

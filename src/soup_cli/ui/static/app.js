@@ -72,7 +72,38 @@ window.stopTrainEventStream = stopTrainEventStream;
   } catch (e) {
     // Defensive: never block app load.
   }
+  // Proactive: don't wait for the first 401 to tell the user something is
+  // wrong — if we land with no token from either source, every button is
+  // about to fail, so say so immediately instead of letting them click
+  // around and hit "Unauthorized" one card at a time.
+  if (!window._authToken) {
+    document.addEventListener('DOMContentLoaded', () => showAuthBanner());
+  }
 })();
+
+function showAuthBanner() {
+  const banner = document.getElementById('auth-banner');
+  if (banner) banner.style.display = 'flex';
+}
+
+function hideAuthBanner() {
+  const banner = document.getElementById('auth-banner');
+  if (banner) banner.style.display = 'none';
+}
+
+function submitAuthToken() {
+  const input = document.getElementById('auth-banner-input');
+  const token = (input.value || '').trim();
+  if (!token) return;
+  window._authToken = token;
+  try { sessionStorage.setItem('soup_auth_token', token); } catch (e) {}
+  input.value = '';
+  hideAuthBanner();
+  pushToast('Token saved for this session.', 'success');
+  // Best-effort refresh of whatever page is showing, now that requests
+  // should actually authenticate.
+  try { navigate(currentPage); } catch (e) {}
+}
 
 // --- State ---
 let currentPage = 'dashboard';
@@ -202,6 +233,18 @@ async function api(path, opts = {}) {
     headers['Authorization'] = 'Bearer ' + window._authToken;
   }
   const resp = await fetch(API + path, { ...opts, headers });
+  if (resp.status === 401) {
+    // Reactive path: covers a token going stale mid-session (e.g. the
+    // `soup ui` process restarted and rotated the token) — the proactive
+    // check in `_bootstrapAuthToken` only catches "no token at all" at
+    // load time. Clear the stale one so `showAuthBanner` isn't fighting a
+    // token that will just 401 again.
+    window._authToken = null;
+    try { sessionStorage.removeItem('soup_auth_token'); } catch (e) {}
+    showAuthBanner();
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(err.detail || 'Unauthorized — session token needed (see banner above).');
+  }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }));
     throw new Error(err.detail || 'API error');
@@ -637,8 +680,8 @@ async function loadTrainingPage() {
 // --- Streaming & Quantization panel ---
 // Sets the RAM-cache slider's max from real available host RAM, and
 // applies the slider/dropdown onto the `training:` block of the currently
-// loaded config via /api/config/patch-training (server-side, re-validated
-// against the real schema — see soup_cli/ui/app.py).
+// loaded config via /api/config/patch-ram-prefetch and /api/config/patch-quant
+// (server-side, re-validated against the real schema — see soup_cli/ui/app.py).
 async function initStreamingPanel() {
   try {
     const ram = await api('/api/system/ram');
@@ -697,8 +740,8 @@ function onQuantStrategyChange() {
   }
 }
 
-function renderConfigDiff(before, after) {
-  const el = document.getElementById('config-diff');
+function renderConfigDiff(before, after, targetId = 'config-diff') {
+  const el = document.getElementById(targetId);
   if (!el) return;
   const beforeLines = before.split('\n');
   const afterLines = after.split('\n');
@@ -722,11 +765,33 @@ function onRamCacheSliderInput() {
     v > 0 ? `${v.toFixed(1)} GB` : '0 GB (disabled)';
 }
 
-async function applyStreamingSettings() {
-  const statusEl = document.getElementById('streaming-settings-status');
+async function applyRamPrefetchSettings() {
+  const statusEl = document.getElementById('ram-prefetch-status');
   const editor = document.getElementById('config-editor');
   if (!editor) return;
   const ramGb = parseFloat(document.getElementById('ram-cache-slider').value || '0');
+  statusEl.textContent = 'Applying...';
+  statusEl.style.color = 'var(--text-dim)';
+  const before = editor.value;
+  try {
+    const result = await api('/api/config/patch-ram-prefetch', {
+      method: 'POST',
+      body: JSON.stringify({ yaml: editor.value, ram_cache_gb: ramGb }),
+    });
+    editor.value = result.yaml;
+    statusEl.textContent = 'Applied to config below.';
+    statusEl.style.color = 'var(--accent)';
+    renderConfigDiff(before, result.yaml, 'ram-prefetch-diff');
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+    statusEl.style.color = 'var(--danger)';
+  }
+}
+
+async function applyQuantSettings() {
+  const statusEl = document.getElementById('quant-settings-status');
+  const editor = document.getElementById('config-editor');
+  if (!editor) return;
   const quant = document.getElementById('quant-strategy-select').value;
   const detailSelect = document.getElementById('quant-detail-select');
   const detail = (quant !== 'none' && detailSelect.options.length) ? detailSelect.value : '';
@@ -734,11 +799,10 @@ async function applyStreamingSettings() {
   statusEl.style.color = 'var(--text-dim)';
   const before = editor.value;
   try {
-    const result = await api('/api/config/patch-training', {
+    const result = await api('/api/config/patch-quant', {
       method: 'POST',
       body: JSON.stringify({
         yaml: editor.value,
-        ram_cache_gb: ramGb,
         custom_quant_strategy: quant,
         custom_quant_detail: detail,
       }),
@@ -746,7 +810,7 @@ async function applyStreamingSettings() {
     editor.value = result.yaml;
     statusEl.textContent = 'Applied to config below.';
     statusEl.style.color = 'var(--accent)';
-    renderConfigDiff(before, result.yaml);
+    renderConfigDiff(before, result.yaml, 'quant-diff');
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message;
     statusEl.style.color = 'var(--danger)';
@@ -1422,17 +1486,20 @@ async function runImportanceScan() {
   const metric = document.getElementById('importance-metric').value;
 
   let calibrationTexts = null;
+  let calibrationDatasetPaths = null;
   if (metric === 'wanda') {
     calibrationTexts = document.getElementById('importance-calib-text').value
       .split('\n').map(s => s.trim()).filter(Boolean);
-    if (calibrationTexts.length === 0) {
-      alert('Wanda needs at least a few lines of calibration text.');
+    calibrationDatasetPaths = document.getElementById('importance-calib-datasets').value
+      .split('\n').map(s => s.trim()).filter(Boolean);
+    if (calibrationTexts.length === 0 && calibrationDatasetPaths.length === 0) {
+      alert('Wanda needs calibration text and/or at least one calibration dataset file.');
       return;
     }
   }
 
   statusEl.textContent = metric === 'wanda'
-    ? 'Loading model + scoring on calibration text (heavier than magnitude)...'
+    ? 'Loading model + scoring on calibration data (heavier than magnitude)...'
     : 'Scanning (streamed, one weight matrix at a time)...';
   resultsEl.innerHTML = '';
   try {
@@ -1444,6 +1511,10 @@ async function runImportanceScan() {
         bottom_k: parseInt(document.getElementById('importance-bottomk').value || '10', 10),
         metric,
         calibration_texts: calibrationTexts,
+        calibration_dataset_paths: calibrationDatasetPaths,
+        calibration_samples_per_dataset: parseInt(
+          document.getElementById('importance-calib-samples-per-file')?.value || '64', 10
+        ),
       }),
     });
     renderCompressJobs();

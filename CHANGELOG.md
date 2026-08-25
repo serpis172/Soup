@@ -14,6 +14,24 @@ reproducing 70+ versions of notes.
 
 ### Added
 
+- **Optional `training.pipeline` compression pipeline: `activation_scan` → `compress` → `distill`, run explicitly via `soup pipeline run config.yaml`.** Each stage (magnitude/Wanda importance scan, neuron-merge/SVD compress, a distill position-marker over the existing `task='distill'` mechanism) is independently opt-in and appears in the same training YAML as everything else; order is fixed and documented in `soup_cli/utils/pipeline_orchestrator.py`. Deliberately not auto-run by `soup train` — see that module's docstring for why. See [docs/pipeline.md](docs/pipeline.md).
+- **`training.objectives`: declare one or more training domains (`code`, `tool_call`, `reasoning`, `chat`, `general`), freely combinable under `task='sft'`/`'distill'`, or `orpo` alone under `task='orpo'`.** A compatibility matrix rejects mixing `orpo` (a preference-pair objective) with the single-response SFT-style objectives, and rejects objectives that don't match the configured `task`.
+- **`data.train`, `data.val` (new), and `data.calibration` (new) all accept a single source or a list of them.** Multiple sources are loaded, format-detected independently, and concatenated — no need to pre-merge with `soup data mix` first to train on datasets in different formats. `data.val` set explicitly replaces the `val_split`-based carve-out rather than shrinking `train`.
+- **`data.verify_before_training` (default `true`): every local train/val/calibration source is checked with the same logic as `soup data inspect` before training starts**, hard-failing on a missing file, zero usable rows, or a fully-degenerate (all-duplicate) file instead of discovering it after the model and optimizer are allocated.
+- **Wanda calibration now accepts more than one dataset file**, both in `soup compress importance --calibration-data` (now repeatable) and the Web UI's importance-scan panel — samples are pooled across all of them via the new shared `neuron_compress.load_calibration_texts`.
+- **`soup pipeline run`**: new CLI command exposing the pipeline orchestrator above.
+
+### Changed
+
+- **GPTQ export bit-width widened to 2/3/4/8-bit** (`soup export --bits`, `training.custom_quant_detail`, and the Web UI's `/api/quant/formats`) — previously capped at `{4, 8}` in three separate, inconsistent places even though `quant_menu.build_gptq_config` already accepted 2/3-bit.
+- **AWQ export bit-width correctly locked to 4-bit only**, with an error explaining this is an `autoawq` library limitation, not Soup's — previously `--bits 8` was silently accepted here and only failed later, inside `quant_menu.build_awq_config`.
+- **Web UI: RAM Prefetch and Quantization split into two cards and two endpoints** (`/api/config/patch-ram-prefetch`, `/api/config/patch-quant`) instead of one combined panel/endpoint. The old combined `/api/config/patch-training` endpoint is kept for backward compatibility.
+- **Web UI: a visible "session token needed" banner now appears when no auth token is found** (e.g. the page was opened without the `?token=...` the CLI prints), with a field to paste one — previously every button just failed with an unrecoverable `401 Unauthorized` and no way to recover without restarting `soup ui` and re-navigating.
+
+### Fixed
+
+- Removed stray `Dockerfile.ui.orig` / `Dockerfile.ui.rej` patch artifacts left in the repo.
+
 - **A ready-made `qwen3.5-9b-grpo` recipe for GRPO reasoning training with `Qwen/Qwen3.5-9B` (#277 by @harshitthek in #448).**
   The recipe combines the established GRPO defaults (accuracy reward, beta=0.1, 4 generations)
   with LoRA r=16 and 4-bit quantization.

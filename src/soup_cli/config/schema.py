@@ -242,7 +242,40 @@ class LoraConfig(BaseModel):
 
 
 class DataConfig(BaseModel):
-    train: str = Field(..., description="Path to training data or HF dataset name")
+    train: Union[str, List[str]] = Field(
+        ...,
+        description=(
+            "Path to training data, an HF dataset name, or a remote fsspec URI. "
+            "Accepts a single source or a list of them (this session) — each "
+            "source is loaded and format-detected independently, then "
+            "concatenated in the order given, so a run can mix e.g. a local "
+            "code JSONL with a chat JSONL without pre-merging them via "
+            "`soup data mix` first."
+        ),
+    )
+    val: Optional[Union[str, List[str]]] = Field(
+        default=None,
+        description=(
+            "Explicit validation source(s) — same accepted shapes as `train` "
+            "(single path/HF-name/URI, or a list). When set, this REPLACES "
+            "the val_split-based carve-out below: the validation set is "
+            "exactly what's loaded from here, not a slice of `train`. None "
+            "(default) keeps the pre-existing val_split behavior unchanged."
+        ),
+    )
+    calibration: Optional[Union[str, List[str]]] = Field(
+        default=None,
+        description=(
+            "Calibration source(s) for the training pipeline's activation-scan "
+            "stage (training.pipeline.activation_scan — Wanda/SVD importance "
+            "scoring before any compress/prune/merge/distill step runs). Same "
+            "accepted shapes as `train`. Independent of `train`/`val` — "
+            "calibration data is meant to be a small representative sample, "
+            "not necessarily the training set itself. When "
+            "training.pipeline.activation_scan.metric='wanda' and this is "
+            "unset, the scan falls back to sampling from `train`."
+        ),
+    )
     format: Literal[
         "alpaca", "sharegpt", "chatml", "dpo", "kto", "llava", "sharegpt4v",
         "plaintext", "embedding", "audio", "tool-calling", "auto",
@@ -255,6 +288,18 @@ class DataConfig(BaseModel):
     ] = Field(
         default="auto",
         description="Data format",
+    )
+    verify_before_training: bool = Field(
+        default=True,
+        description=(
+            "Run the same checks as `soup data inspect` against every "
+            "resolved train/val/calibration source before training starts, "
+            "aborting on hard failures (missing file, zero usable rows, "
+            "unreadable format) instead of discovering it after the model "
+            "and optimizer are already allocated. Local file sources only — "
+            "HF dataset names and remote URIs are skipped (nothing to "
+            "inspect locally) and reported as such, not silently passed."
+        ),
     )
     val_split: float = Field(default=0.1, ge=0.0, le=0.5, description="Validation split ratio")
     max_length: int = Field(
@@ -304,6 +349,17 @@ class DataConfig(BaseModel):
             "permutation. None = seed 0. (v0.71.10 #199)"
         ),
     )
+
+    @field_validator("train", "val", "calibration", mode="before")
+    @classmethod
+    def _validate_source_list_nonempty(cls, v, info):
+        # A `[]` here would silently produce zero training rows far
+        # downstream in data/loader.py, with an error that doesn't point
+        # back at the config. Catch it at validation time instead, with the
+        # field name so the message is actionable.
+        if isinstance(v, list) and len(v) == 0:
+            raise ValueError(f"data.{info.field_name} cannot be an empty list")
+        return v
 
     @field_validator("raft_shuffle_seed", mode="before")
     @classmethod
@@ -3077,11 +3133,32 @@ class TrainingConfig(BaseModel):
     custom_quant_detail: Optional[str] = Field(
         default=None,
         description=(
-            "Dettaglio della quantizzazione scelta in custom_quant_strategy: per awq/gptq è il "
-            "numero di bit ('4' o '8'); per k-quants è un tipo GGUF standard (es. 'Q4_K_M'); per "
-            "i-quants è un formato GGUF avanzato (es. 'IQ4_XS', 'UD-Q4_K_XL' — vedi "
+            "Dettaglio della quantizzazione scelta in custom_quant_strategy: per awq è sempre "
+            "'4' (l'algoritmo è 4-bit-only); per gptq è il numero di bit — '2', '3', '4' o '8'; "
+            "per k-quants è un tipo GGUF standard (es. 'Q4_K_M'); per i-quants è un formato GGUF "
+            "avanzato (es. 'IQ4_XS', 'UD-Q4_K_XL' — vedi "
             "soup_cli.utils.gguf_quant.ALL_ADVANCED_GGUF_FORMATS). None = usa il default del "
             "formato scelto."
+        ),
+    )
+    objectives: Optional[List[Literal[
+        "code", "tool_call", "reasoning", "chat", "general", "orpo",
+    ]]] = Field(
+        default=None,
+        description=(
+            "One or more training objectives/domains this run targets. "
+            "'code', 'tool_call', 'reasoning', 'chat', 'general' are SFT-style "
+            "single-response domains and may be freely combined with each "
+            "other under task='sft' (or 'distill') — they describe what kind "
+            "of data(s) `data.train` mixes, for bookkeeping/eval-routing/model "
+            "-card purposes; combining them does not change the loss "
+            "function, just which domains the run is documented as covering. "
+            "'orpo' is a distinct preference-pair objective (task='orpo') and "
+            "is INCOMPATIBLE with every other value — it cannot be combined, "
+            "because ORPO trains on (prompt, chosen, rejected) triplets, not "
+            "the single-response rows the SFT-style objectives assume. See "
+            "`_validate_objectives_compat` for the enforced compatibility "
+            "matrix. None (default) = unset, no behavior change."
         ),
     )
     stream_vram_override: Optional[int] = Field(
@@ -3781,6 +3858,134 @@ class TrainingConfig(BaseModel):
         from soup_cli.utils.grace_codebook import validate_grace_codebook_dim
 
         return validate_grace_codebook_dim(v)
+
+    # ---- Compression pipeline (this session) ------------------------------
+    pipeline: Optional["PipelineConfig"] = Field(
+        default=None,
+        description=(
+            "Ordered, optional pre-training pipeline: activation_scan -> "
+            "compress -> distill, then the normal train stage runs as "
+            "before. Each stage is independently opt-in (all off by "
+            "default = zero behavior change for every config that doesn't "
+            "set this). Order is fixed, not configurable — scanning after "
+            "compressing would score an already-pruned model, and "
+            "distilling before compressing would waste the distillation "
+            "run on weights about to be thrown away. See PipelineConfig."
+        ),
+    )
+
+
+class ActivationScanStageConfig(BaseModel):
+    """Pre-training importance scan (magnitude or Wanda) — the FIRST
+    pipeline stage. Produces a JSON report ranking neurons/rows by
+    importance; does not modify the checkpoint itself. Typically feeds the
+    `compress` stage's merge/prune decisions, though nothing here enforces
+    that hand-off automatically — the report is written to `output_path`
+    for the next stage (or a human) to consume.
+    """
+
+    enabled: bool = False
+    metric: Literal["magnitude", "wanda"] = Field(
+        default="magnitude",
+        description=(
+            "'magnitude': weight-only, no calibration data or loaded model "
+            "needed beyond the checkpoint files. 'wanda': activation-aware "
+            "(Sun et al., ICLR 2024) — needs the model loaded and "
+            "calibration text; uses data.calibration if set, else samples "
+            "from data.train."
+        ),
+    )
+    modules: str = Field(default="mlp,attn", description="Same syntax as `soup compress importance --modules`.")
+    bottom_k: int = Field(default=10, ge=1, le=200)
+    max_length: int = Field(default=512, ge=16, le=4096)
+    calibration_samples_per_dataset: int = Field(
+        default=64, ge=1, le=2000,
+        description="Only used when metric='wanda'. See load_calibration_texts.",
+    )
+    output_path: Optional[str] = Field(
+        default=None,
+        description="Where to write the JSON importance report. None = "
+        "<output_dir>/pipeline_activation_scan.json.",
+    )
+
+
+class CompressStageConfig(BaseModel):
+    """Pre-training checkpoint compression — the SECOND pipeline stage,
+    after activation_scan and before distill/train. Writes a NEW local
+    checkpoint directory and the orchestrator points the run at it; the
+    original checkpoint is never modified in place.
+    """
+
+    enabled: bool = False
+    strategy: Literal["merge", "svd"] = Field(
+        default="merge",
+        description=(
+            "'merge': cosine-similarity neuron merging in MLP layers "
+            "(neuron_compress.find_merge_candidates / "
+            "apply_merges_to_checkpoint). 'svd': low-rank SVD compression "
+            "(svd_compress.analyze_svd / apply_svd_to_checkpoint)."
+        ),
+    )
+    merge_threshold: float = Field(
+        default=0.95, ge=0.0, le=1.0,
+        description="Cosine-similarity threshold for strategy='merge' candidate pairs.",
+    )
+    merge_allow_nonuniform: bool = Field(
+        default=False,
+        description=(
+            "strategy='merge' only. False (default) enforces a uniform "
+            "intermediate_size across layers (stock-loadable checkpoint); "
+            "True allows a per-layer-varying width (needs custom loading "
+            "code — see apply_merges_to_checkpoint's docstring)."
+        ),
+    )
+    svd_energy_threshold: float = Field(
+        default=0.90, ge=0.5, le=0.999,
+        description="strategy='svd' only. Retained singular-value energy fraction per matrix.",
+    )
+    svd_mode: Literal["denoise", "factorize"] = Field(
+        default="denoise",
+        description=(
+            "strategy='svd' only. 'denoise' keeps the original tensor shape "
+            "(always stock-loadable). 'factorize' writes real U/V factors "
+            "(smaller file, needs custom loading code)."
+        ),
+    )
+    output_dir: Optional[str] = Field(
+        default=None,
+        description="Where the compressed checkpoint is written. None = "
+        "<output_dir>/pipeline_compressed_checkpoint.",
+    )
+
+
+class DistillStageConfig(BaseModel):
+    """Position marker for distillation in the pipeline sequence — the
+    THIRD stage, after compress and before the normal train stage.
+
+    This does NOT reimplement distillation: that already exists as
+    task='distill' + the top-level distill_divergence / distill_temperature
+    / distill_mode / teacher_model fields, with its own trainer wiring
+    (utils/distill.py). Setting pipeline.distill.enabled=True is a
+    documentation + validation step — it asserts that the rest of the
+    config is actually configured for distillation (cross-checked in
+    `_validate_pipeline_stages`) — not a second, competing distillation
+    mechanism. It exists so a compress-then-distill run has ONE place that
+    says "yes, both stages are intentional and in this order" instead of
+    that being implicit in which fields happen to be set.
+    """
+
+    enabled: bool = False
+
+
+class PipelineConfig(BaseModel):
+    """training.pipeline — see TrainingConfig.pipeline's Field description
+    for the fixed stage order (activation_scan -> compress -> distill ->
+    train). Each stage defaults to unset/disabled.
+    """
+
+    activation_scan: Optional[ActivationScanStageConfig] = None
+    compress: Optional[CompressStageConfig] = None
+    distill: Optional[DistillStageConfig] = None
 
 
 class ShipConfig(BaseModel):
@@ -5142,12 +5347,33 @@ class SoupConfig(BaseModel):
         if tcfg.custom_quant_detail is not None:
             detail = tcfg.custom_quant_detail
             strategy = tcfg.custom_quant_strategy
-            if strategy in ("awq", "gptq"):
-                if detail not in ("4", "8"):
+            if strategy == "awq":
+                # AWQ is a 4-bit-only method in every mainstream implementation
+                # (autoawq / llm-awq): the activation-aware scale search the
+                # algorithm is built on is defined for a 4-bit grid, there is
+                # no 2/3/8-bit AWQ kernel to target. Widening this would
+                # accept a config that fails at export time instead of at
+                # validation time, so it stays a hard 4.
+                if detail != "4":
                     raise ValueError(
                         f"training.custom_quant_detail={detail!r} non valido per "
-                        f"custom_quant_strategy={strategy!r}: deve essere '4' o '8' "
-                        f"(bit). Vedi soup export --bits."
+                        f"custom_quant_strategy='awq': AWQ supporta solo 4 bit "
+                        f"(limite della libreria autoawq, non di Soup). Per bit "
+                        f"width diverse usa custom_quant_strategy='gptq' "
+                        f"(2/3/4/8 bit) o 'k-quants'/'i-quants' (GGUF)."
+                    )
+            elif strategy == "gptq":
+                # GPTQModel / AutoGPTQ support 2/3/4/8-bit — this now matches
+                # soup_cli.utils.quant_menu.build_gptq_config's own domain
+                # (previously this validator only let '4'/'8' through even
+                # though the GPTQ builder already accepted 2/3, so a valid
+                # 2-bit or 3-bit GPTQ config was rejected here before it ever
+                # reached the exporter).
+                if detail not in ("2", "3", "4", "8"):
+                    raise ValueError(
+                        f"training.custom_quant_detail={detail!r} non valido per "
+                        f"custom_quant_strategy='gptq': deve essere '2', '3', '4' "
+                        f"o '8' (bit). Vedi soup export --bits."
                     )
             elif strategy == "k-quants":
                 from soup_cli.utils.gguf_quant import is_standard_gguf_quant_type
@@ -5174,6 +5400,88 @@ class SoupConfig(BaseModel):
                     f"training.custom_quant_detail è impostato ma "
                     f"custom_quant_strategy={strategy!r} non ne prevede uno "
                     f"(solo awq/gptq/k-quants/i-quants)."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_objectives_compat(self) -> "SoupConfig":
+        """training.objectives compatibility matrix.
+
+        Two groups, deliberately NOT combinable across the boundary:
+          - SFT-style single-response domains: {code, tool_call, reasoning,
+            chat, general}. Freely combinable with each other (they share
+            the same row shape — a prompt and one target response — so
+            mixing datasets from different domains under one SFT loss is
+            just... a mixed SFT dataset, which is already how `data.train`
+            accepting a list works). Requires task in {sft, distill}.
+          - Preference-pair objective: {orpo}. Needs (prompt, chosen,
+            rejected) triplets — a fundamentally different row shape — so
+            it can't share a batch with SFT-style rows. Must be the ONLY
+            entry when present, and requires task='orpo'.
+
+        Not attempting to also validate 'reasoning' against task='grpo': the
+        'reasoning' objective here means "this SFT run includes
+        reasoning/CoT-style data", which is orthogonal to whether a
+        *separate* GRPO run is later used for RL fine-tuning — conflating
+        the two would make it impossible to declare "SFT warm-start on
+        reasoning data" (a real, common pipeline stage) without task='grpo'.
+        """
+        tcfg = self.training
+        objectives = tcfg.objectives
+        if not objectives:
+            return self
+
+        sft_style = {"code", "tool_call", "reasoning", "chat", "general"}
+        if "orpo" in objectives:
+            if len(objectives) > 1:
+                others = sorted(set(objectives) - {"orpo"})
+                raise ValueError(
+                    f"training.objectives=['orpo', ...] non valido: 'orpo' è un "
+                    f"obiettivo a coppie di preferenza (prompt/chosen/rejected) "
+                    f"e non è combinabile con {others} (obiettivi SFT a singola "
+                    f"risposta). Usa training.objectives=['orpo'] da solo."
+                )
+            if self.task != "orpo":
+                raise ValueError(
+                    f"training.objectives=['orpo'] richiede task='orpo', trovato "
+                    f"task={self.task!r}."
+                )
+        else:
+            unknown = set(objectives) - sft_style
+            if unknown:
+                raise ValueError(
+                    f"training.objectives contiene valori non riconosciuti: "
+                    f"{sorted(unknown)}"
+                )
+            if self.task not in ("sft", "distill"):
+                raise ValueError(
+                    f"training.objectives={objectives} (obiettivi SFT) richiede "
+                    f"task='sft' o task='distill', trovato task={self.task!r}."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_pipeline_stages(self) -> "SoupConfig":
+        """training.pipeline stage cross-checks.
+
+        activation_scan / compress are self-contained (operate on a
+        checkpoint directory, don't depend on `task`), so nothing to check
+        there beyond what each stage's own Field constraints already
+        enforce. distill is the one stage that's a position marker over
+        EXISTING top-level fields rather than its own mechanism (see
+        DistillStageConfig's docstring) — enabling it without task='distill'
+        would silently do nothing at the distill step, which is worse than
+        refusing to validate.
+        """
+        pipeline = self.training.pipeline
+        if pipeline is None:
+            return self
+        if pipeline.distill is not None and pipeline.distill.enabled:
+            if self.task != "distill":
+                raise ValueError(
+                    "training.pipeline.distill.enabled=True richiede task='distill' "
+                    f"(vedi training.distill_divergence / distill_temperature / "
+                    f"distill_mode / teacher_model), trovato task={self.task!r}."
                 )
         return self
 

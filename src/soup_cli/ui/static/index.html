@@ -8,6 +8,26 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
+  <!-- Session-token recovery banner. Shown whenever the app has no auth
+       token at all (opened the bare URL instead of the ?token=... link
+       `soup ui` prints) or a request comes back 401 — see `_authRequired()`
+       / the api() helper in app.js. Without this, every button just failed
+       with an unrecoverable "Error: Unauthorized" and no path forward. -->
+  <div id="auth-banner" style="display:none">
+    <div class="auth-banner-box">
+      <div class="auth-banner-title">Session token needed</div>
+      <div class="auth-banner-text">
+        This page has no session token, so every action will fail with
+        "Unauthorized". Open the full URL <code>soup ui</code> printed
+        (it ends in <code>?token=...</code>), or paste the token here:
+      </div>
+      <div class="auth-banner-row">
+        <input type="text" id="auth-banner-input" placeholder="paste token"
+               onkeydown="if(event.key==='Enter') submitAuthToken()">
+        <button class="btn btn-primary btn-sm" onclick="submitAuthToken()">Use token</button>
+      </div>
+    </div>
+  </div>
   <div class="app">
     <!-- Sidebar -->
     <aside class="sidebar">
@@ -69,45 +89,51 @@
         <div id="training-content">
           <div style="text-align:center;padding:3rem;color:var(--text-dim)">Loading...</div>
         </div>
-        <!-- Streaming & Quantization -->
+        <!-- Layer RAM Prefetch (split from quantization — see app.js history) -->
         <div class="card">
-          <div class="card-title">Streaming &amp; Quantization</div>
-          <div class="grid-2">
-            <div class="form-group">
-              <label class="form-label">
-                Layer RAM prefetch: <span id="ram-cache-val">0 GB (disabled)</span>
-                — <span id="ram-cache-avail" style="color:var(--text-dim)"></span>
-              </label>
-              <input type="range" id="ram-cache-slider" min="0" max="16" step="0.5" value="0"
-                     oninput="onRamCacheSliderInput()">
-              <div class="empty-state-hint" style="margin-top:0.35rem">
-                A background thread reads upcoming decoder layers ahead of need into
-                pinned host RAM, for streamed checkpoints too large to fully fit.
-                0 = disabled (plain disk/RAM tier).
-              </div>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Post-training quantization</label>
-              <select id="quant-strategy-select" onchange="onQuantStrategyChange()">
-                <option value="none">None</option>
-                <option value="awq">AWQ</option>
-                <option value="gptq">GPTQ</option>
-                <option value="k-quants">GGUF k-quants</option>
-                <option value="i-quants">GGUF i-quants / UD (imatrix)</option>
-              </select>
-              <div id="quant-detail-group" style="margin-top:0.5rem;display:none">
-                <label class="form-label" id="quant-detail-label">Bits</label>
-                <select id="quant-detail-select"></select>
-              </div>
-              <div class="empty-state-hint" style="margin-top:0.35rem">
-                Applied automatically after training via <code>soup export</code> — the
-                trainer prints the exact command once the checkpoint is ready.
-              </div>
+          <div class="card-title">Layer RAM Prefetch</div>
+          <div class="form-group">
+            <label class="form-label">
+              Layer RAM prefetch: <span id="ram-cache-val">0 GB (disabled)</span>
+              — <span id="ram-cache-avail" style="color:var(--text-dim)"></span>
+            </label>
+            <input type="range" id="ram-cache-slider" min="0" max="16" step="0.5" value="0"
+                   oninput="onRamCacheSliderInput()">
+            <div class="empty-state-hint" style="margin-top:0.35rem">
+              A background thread reads upcoming decoder layers ahead of need into
+              pinned host RAM, for streamed checkpoints too large to fully fit.
+              0 = disabled (plain disk/RAM tier).
             </div>
           </div>
-          <button class="btn btn-primary btn-sm" onclick="applyStreamingSettings()">Apply to config</button>
-          <span id="streaming-settings-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
-          <div id="config-diff" style="margin-top:0.5rem"></div>
+          <button class="btn btn-primary btn-sm" onclick="applyRamPrefetchSettings()">Apply to config</button>
+          <span id="ram-prefetch-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="ram-prefetch-diff" style="margin-top:0.5rem"></div>
+        </div>
+        <!-- Model Quantization (split from RAM prefetch — see app.js history) -->
+        <div class="card">
+          <div class="card-title">Model Quantization</div>
+          <div class="form-group">
+            <label class="form-label">Post-training quantization</label>
+            <select id="quant-strategy-select" onchange="onQuantStrategyChange()">
+              <option value="none">None</option>
+              <option value="awq">AWQ</option>
+              <option value="gptq">GPTQ</option>
+              <option value="k-quants">GGUF k-quants</option>
+              <option value="i-quants">GGUF i-quants / UD (imatrix)</option>
+            </select>
+            <div id="quant-detail-group" style="margin-top:0.5rem;display:none">
+              <label class="form-label" id="quant-detail-label">Bits</label>
+              <select id="quant-detail-select"></select>
+            </div>
+            <div class="empty-state-hint" style="margin-top:0.35rem">
+              Applied automatically after training via <code>soup export</code> — the
+              trainer prints the exact command once the checkpoint is ready.
+              AWQ is always 4-bit (library limitation); GPTQ supports 2/3/4/8-bit.
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="applyQuantSettings()">Apply to config</button>
+          <span id="quant-settings-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="quant-diff" style="margin-top:0.5rem"></div>
         </div>
         <!-- Training Progress Bar -->
         <div id="train-progress" class="card" style="display:none">
@@ -339,8 +365,18 @@
             </div>
           </div>
           <div class="form-group" id="importance-calib-group" style="display:none">
-            <label class="form-label">Calibration text (one sample per line)</label>
+            <label class="form-label">Calibration text (one sample per line, optional)</label>
             <textarea id="importance-calib-text" rows="4" placeholder="A few sentences representative of your domain — 10-50 lines is usually enough."></textarea>
+            <label class="form-label" style="margin-top:0.5rem">
+              Calibration dataset files (one JSONL path per line, optional — combine as many as you like)
+            </label>
+            <textarea id="importance-calib-datasets" rows="3" placeholder="data/code_samples.jsonl&#10;data/chat_samples.jsonl&#10;data/domain_corpus.jsonl"></textarea>
+            <div class="empty-state-hint" style="margin-top:0.35rem">
+              Pooled with the pasted text above, if any. Each file contributes up to the sample
+              cap below, so one large dataset can't crowd the others out.
+            </div>
+            <label class="form-label" style="margin-top:0.5rem">Samples per dataset file</label>
+            <input type="number" id="importance-calib-samples-per-file" value="64" min="1" max="2000" style="max-width:8rem">
           </div>
           <button class="btn btn-primary btn-sm" onclick="runImportanceScan()">Scan importance</button>
           <span id="importance-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>

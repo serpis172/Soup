@@ -44,7 +44,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from soup_cli.utils.spectrum_scan import (
     _discover_safetensors,
@@ -589,6 +589,88 @@ def apply_merges_to_checkpoint(
 # model loaded (not just streamed weight files) and a calibration batch,
 # so it's opt-in and heavier by nature. Aggregated per output row (neuron)
 # the same way as the magnitude-only score, for a like-for-like ranking.
+
+
+# ---------------------------------------------------------------------------
+# Calibration text loading — shared by CLI (`soup compress importance
+# --metric wanda`), the UI's `/api/compress/importance/scan`, and
+# `soup export`'s AWQ/GPTQ paths.
+#
+# Previously each of those three call sites had its own copy-pasted "read
+# JSONL, pull the 'text' field" loop, and none of them accepted more than one
+# file — so a Wanda calibration set spanning code + chat + a domain-specific
+# corpus had to be manually concatenated into a single file first. This is
+# now the one place that logic lives; it accepts one path OR a list, and
+# samples up to `max_samples_per_file` from *each* file so one large file
+# can't starve the others out of the pool.
+# ---------------------------------------------------------------------------
+
+
+def load_calibration_texts(
+    paths: Union[str, List[str]],
+    *,
+    max_samples_per_file: int = 128,
+    max_samples_total: Optional[int] = None,
+) -> List[str]:
+    """Load calibration text samples from one or more JSONL files.
+
+    Args:
+        paths: a single file path, or a list of file paths. Each file is a
+            JSONL where every line is either ``{"text": "..."}`` or an
+            arbitrary object whose string-valued fields get space-joined
+            (mirrors the single-file loaders this replaces, so existing
+            calibration files need no changes).
+        max_samples_per_file: cap on how many lines are read from any one
+            file, so one large dataset can't crowd out the others when
+            several are given.
+        max_samples_total: optional overall cap across all files combined,
+            applied after per-file sampling.
+
+    Returns:
+        A flat list of text samples, in file order, files in the order
+        given. Empty/unreadable lines are skipped; a file that yields zero
+        usable lines is skipped with a warning logged, not a hard failure —
+        one bad file in a multi-dataset list shouldn't sink the whole scan.
+    """
+    import json as json_mod
+
+    if isinstance(paths, str):
+        paths = [paths]
+
+    all_texts: List[str] = []
+    for path in paths:
+        file_texts: List[str] = []
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json_mod.loads(line)
+                    except json_mod.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        if "text" in row and row["text"]:
+                            file_texts.append(str(row["text"]))
+                        else:
+                            joined = " ".join(str(v) for v in row.values() if v)
+                            if joined:
+                                file_texts.append(joined)
+                    elif isinstance(row, str) and row:
+                        file_texts.append(row)
+                    if len(file_texts) >= max_samples_per_file:
+                        break
+        except (OSError, FileNotFoundError) as exc:
+            logger.warning("calibration file %r unreadable, skipping: %s", path, exc)
+            continue
+        if not file_texts:
+            logger.warning("calibration file %r yielded no usable text rows", path)
+        all_texts.extend(file_texts)
+
+    if max_samples_total is not None:
+        all_texts = all_texts[:max_samples_total]
+    return all_texts
 
 
 def compute_wanda_importance(

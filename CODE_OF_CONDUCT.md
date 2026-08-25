@@ -1,5 +1,10 @@
 # Contributor Covenant Code of Conduct
 
+> **Fork notice:** this is a fork of [MakazhanAlpamys/Soup](https://github.com/MakazhanAlpamys/Soup).
+> This Code of Conduct applies to interactions in *this* fork's repository (issues, PRs,
+> discussions here). It does not speak for or bind the upstream project — see upstream's own
+> `CODE_OF_CONDUCT.md` for interactions there.
+
 ## Our Pledge
 
 We as members, contributors, and leaders pledge to make participation in our community a harassment-free experience for everyone, regardless of age, body size, visible or invisible disability, ethnicity, sex characteristics, gender identity and expression, level of experience, education, socio-economic status, nationality, personal appearance, race, religion, or sexual identity and orientation.
@@ -36,7 +41,13 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the project maintainer at **team@trysoup.dev** (the project address) or **makazanalpamys@gmail.com** (the maintainer's personal address). All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior **in this fork's
+repository** should be reported by opening a GitHub issue on
+[serpis172/Soup](https://github.com/serpis172/Soup) or contacting its maintainer directly.
+For conduct in the upstream project's own spaces, report to upstream via **team@trysoup.dev**
+(the project address) or **makazanalpamys@gmail.com** (the upstream maintainer's personal
+address) — not this fork's maintainer, who has no authority over upstream spaces. All
+complaints will be reviewed and investigated promptly and fairly.
 
 This Code of Conduct applies in every project space, including the [Discord server](https://discord.gg/8RgVbFA6Zq).
 

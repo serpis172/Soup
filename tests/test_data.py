@@ -1,6 +1,9 @@
 """Tests for data loading, format detection, and validation."""
 
+import json
 from pathlib import Path
+
+import pytest
 
 from soup_cli.data.formats import detect_format, format_to_messages
 from soup_cli.data.loader import load_raw_data
@@ -83,3 +86,70 @@ def test_convert_dpo():
     assert result["prompt"] == "Explain gravity"
     assert result["chosen"] == "Gravity is a force"
     assert result["rejected"] == "No idea"
+
+
+# --- verify_dataset_sources (this session's pre-training data gate) -----
+
+
+def test_verify_dataset_sources_passes_good_file(tmp_path: Path):
+    from soup_cli.commands.data import verify_dataset_sources
+
+    f = tmp_path / "good.jsonl"
+    f.write_text(
+        "\n".join(
+            json.dumps({"instruction": f"Q{i}", "output": f"A{i}"}) for i in range(5)
+        )
+        + "\n"
+    )
+    verify_dataset_sources([str(f)], "train")  # should not raise
+
+
+def test_verify_dataset_sources_rejects_missing_file(tmp_path: Path):
+    from soup_cli.commands.data import verify_dataset_sources
+
+    with pytest.raises(ValueError, match="not found"):
+        verify_dataset_sources([str(tmp_path / "nope.jsonl")], "val")
+
+
+def test_verify_dataset_sources_rejects_empty_file(tmp_path: Path):
+    from soup_cli.commands.data import verify_dataset_sources
+
+    f = tmp_path / "empty.jsonl"
+    f.write_text("")
+    with pytest.raises(ValueError, match="zero usable rows"):
+        verify_dataset_sources([str(f)], "train")
+
+
+def test_verify_dataset_sources_rejects_fully_degenerate_file(tmp_path: Path):
+    """Every row identical => only 1 unique row => hard failure, not just a
+    'Duplicates: 4' stat nobody looks at until training already burned GPU
+    time on it."""
+    from soup_cli.commands.data import verify_dataset_sources
+
+    f = tmp_path / "dup.jsonl"
+    f.write_text(
+        "\n".join(json.dumps({"instruction": "same", "output": "same"}) for _ in range(5))
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="only 1 unique row"):
+        verify_dataset_sources([str(f)], "calibration")
+
+
+def test_verify_dataset_sources_allows_partial_duplicates(tmp_path: Path):
+    """Some repeated rows among otherwise-real data is normal and must NOT
+    be treated as the degenerate/fully-duplicated case above."""
+    from soup_cli.commands.data import verify_dataset_sources
+
+    f = tmp_path / "mixed.jsonl"
+    rows = [{"instruction": "a", "output": "a"}] * 2 + [{"instruction": "b", "output": "b"}]
+    f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    verify_dataset_sources([str(f)], "train")  # should not raise
+
+
+def test_verify_dataset_sources_skips_hf_and_remote_sources():
+    """HF dataset names and remote URIs have nothing local to inspect —
+    must be skipped, not treated as missing files."""
+    from soup_cli.commands.data import verify_dataset_sources
+
+    verify_dataset_sources(["some-org/some-dataset"], "train")  # no suffix => HF-style
+    verify_dataset_sources(["s3://bucket/data.jsonl"], "train")  # remote URI

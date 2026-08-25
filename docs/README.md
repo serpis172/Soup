@@ -18,6 +18,7 @@ feature reference — every `soup` capability, grouped by area.
 | [Backends, platform & ops](backends-and-ops.md) | MLX/Unsloth backends, Modal cloud GPU training, alternative hubs, HF Hub integration, autopilot, experiment tracking, plan/apply, env lockfiles, hardware-fit, completions, plugins, utility commands |
 | [Command reference](commands.md) | The full `soup` command list |
 | [Supported models & extras](models.md) | Recommended model families, the VRAM size guide, the pip extras matrix |
+| [Compression pipeline, objectives & multi-dataset](pipeline.md) | Fork addition: ordered `training.pipeline` (scan → compress → distill), `training.objectives` compatibility matrix, multi-source `data.train`/`val`/`calibration`, pre-training `soup data inspect` gate, widened AWQ/GPTQ bit-width options |
 
 > Per-release notes live on the [GitHub Releases](https://github.com/MakazhanAlpamys/Soup/releases)
 > page; see also the repo-root [CHANGELOG.md](../CHANGELOG.md).

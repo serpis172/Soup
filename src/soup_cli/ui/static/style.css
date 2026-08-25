@@ -547,3 +547,52 @@ input[type="range"] {
 .form-section[open] summary {
   margin-bottom: 0.5rem;
 }
+
+/* Session-token recovery banner (see index.html / app.js) */
+#auth-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 1000;
+  display: flex;
+  justify-content: center;
+  padding: 0.75rem;
+  background: rgba(17, 16, 20, 0.92);
+  border-bottom: 1px solid var(--danger);
+  backdrop-filter: blur(4px);
+}
+.auth-banner-box {
+  max-width: 640px;
+  width: 100%;
+  background: var(--bg-card);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+.auth-banner-title {
+  color: var(--danger);
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}
+.auth-banner-text {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  margin-bottom: 0.6rem;
+}
+.auth-banner-text code {
+  background: var(--bg-input);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
+.auth-banner-row {
+  display: flex;
+  gap: 0.5rem;
+}
+.auth-banner-row input {
+  flex: 1;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 0.4rem 0.6rem;
+}

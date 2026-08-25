@@ -946,30 +946,27 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         return snapshot
 
     # --- Streaming / quantization config patch ---
+    #
+    # Bug fix (this session): these used to be ONE panel + ONE endpoint
+    # (`/api/config/patch-training` patching both `ram_cache_gb` and
+    # `custom_quant_*` in a single request). Layer RAM prefetch and
+    # post-training quantization are unrelated settings — one tunes how the
+    # frozen base streams during training, the other tunes how the finished
+    # checkpoint is exported — so they're now two cards with two endpoints.
+    # `_patch_training_yaml` is the shared helper both route through so the
+    # "load → patch → re-validate → dump" logic isn't duplicated.
 
-    class TrainingPatchRequest(PydanticBaseModel):
-        """Patch a subset of `training:` fields in a YAML config string."""
-        yaml: str
-        ram_cache_gb: Optional[float] = Field(default=None, ge=0.0)
-        custom_quant_strategy: Optional[str] = None
-        custom_quant_detail: Optional[str] = None
-
-    @app.post("/api/config/patch-training", dependencies=[Depends(_verify_token)])
-    def patch_training_config(req: TrainingPatchRequest):
-        """Set ram_cache_gb / custom_quant_strategy on a config's `training:`
-        block and return the updated, re-validated YAML string.
-
-        Used by the "Streaming & Quantization" panel so the RAM slider and
-        quant dropdown edit the real config instead of the user hand-editing
-        YAML. Round-trips through `load_config_from_string` so the result is
-        guaranteed loadable before it's handed back to the editor.
+    def _patch_training_yaml(yaml_text: str, patch: Dict[str, Any]) -> str:
+        """Apply `patch` onto a config's `training:` block and return the
+        updated, re-validated YAML string. Shared by the RAM-prefetch and
+        quantization patch endpoints below.
         """
         import yaml as yaml_mod
 
         from soup_cli.config.loader import load_config_from_string
 
         try:
-            doc = yaml_mod.safe_load(req.yaml) or {}
+            doc = yaml_mod.safe_load(yaml_text) or {}
         except yaml_mod.YAMLError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid YAML: {exc}")
         if not isinstance(doc, dict):
@@ -978,22 +975,80 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         training = doc.get("training")
         if not isinstance(training, dict):
             training = {}
-        if req.ram_cache_gb is not None:
-            training["ram_cache_gb"] = req.ram_cache_gb
-        if req.custom_quant_strategy is not None:
-            training["custom_quant_strategy"] = req.custom_quant_strategy
-        if req.custom_quant_detail is not None:
-            if req.custom_quant_detail == "":
-                training.pop("custom_quant_detail", None)
+        for key, value in patch.items():
+            if value is None:
+                continue
+            if value == "":
+                training.pop(key, None)
             else:
-                training["custom_quant_detail"] = req.custom_quant_detail
+                training[key] = value
         doc["training"] = training
 
         try:
             new_yaml = yaml_mod.dump(doc, default_flow_style=False, sort_keys=False)
             load_config_from_string(new_yaml)  # validate before handing back
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Resulting config is invalid: {exc}")
+        return new_yaml
+
+    class RamPrefetchPatchRequest(PydanticBaseModel):
+        """Patch just `training.ram_cache_gb` in a YAML config string."""
+        yaml: str
+        ram_cache_gb: float = Field(ge=0.0)
+
+    @app.post("/api/config/patch-ram-prefetch", dependencies=[Depends(_verify_token)])
+    def patch_ram_prefetch_config(req: RamPrefetchPatchRequest):
+        """Set `training.ram_cache_gb` — the "Layer RAM Prefetch" card's own
+        endpoint, separate from quantization (see comment above).
+        """
+        new_yaml = _patch_training_yaml(req.yaml, {"ram_cache_gb": req.ram_cache_gb})
+        return {"yaml": new_yaml}
+
+    class QuantPatchRequest(PydanticBaseModel):
+        """Patch `training.custom_quant_strategy` / `custom_quant_detail`."""
+        yaml: str
+        custom_quant_strategy: str
+        custom_quant_detail: Optional[str] = None
+
+    @app.post("/api/config/patch-quant", dependencies=[Depends(_verify_token)])
+    def patch_quant_config(req: QuantPatchRequest):
+        """Set `training.custom_quant_strategy` / `custom_quant_detail` — the
+        "Model Quantization" card's own endpoint, separate from RAM prefetch.
+        """
+        new_yaml = _patch_training_yaml(
+            req.yaml,
+            {
+                "custom_quant_strategy": req.custom_quant_strategy,
+                "custom_quant_detail": req.custom_quant_detail or "",
+            },
+        )
+        return {"yaml": new_yaml}
+
+    class TrainingPatchRequest(PydanticBaseModel):
+        """Patch a subset of `training:` fields in a YAML config string.
+
+        Deprecated (kept for backward compatibility with any external caller
+        already using it): prefer `/api/config/patch-ram-prefetch` and
+        `/api/config/patch-quant`, which the UI now calls instead.
+        """
+        yaml: str
+        ram_cache_gb: Optional[float] = Field(default=None, ge=0.0)
+        custom_quant_strategy: Optional[str] = None
+        custom_quant_detail: Optional[str] = None
+
+    @app.post("/api/config/patch-training", dependencies=[Depends(_verify_token)])
+    def patch_training_config(req: TrainingPatchRequest):
+        """Deprecated combined patch endpoint — see `TrainingPatchRequest`."""
+        new_yaml = _patch_training_yaml(
+            req.yaml,
+            {
+                "ram_cache_gb": req.ram_cache_gb,
+                "custom_quant_strategy": req.custom_quant_strategy,
+                "custom_quant_detail": req.custom_quant_detail,
+            },
+        )
         return {"yaml": new_yaml}
 
     # --- HuggingFace Hub: search + download (models / datasets / benchmarks) ---
@@ -1175,12 +1230,24 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         utils/gguf_quant.py's registry — the same one config/schema.py
         validates training.custom_quant_detail against — so the UI can
         never offer a value the backend would then reject.
+
+        Bug fix: this used to offer `[4, 8]` for BOTH awq and gptq. AWQ is a
+        4-bit-only method (autoawq has no 8-bit kernel — offering 8 here just
+        set the user up for a later export-time failure), and GPTQ actually
+        supports 2/3/4/8-bit but only 4/8 were ever exposed. Both are now
+        sourced from the same domain config/schema.py's
+        `_validate_custom_quant_detail` enforces, so this list and that
+        validator cannot drift apart again.
         """
         from soup_cli.utils.gguf_quant import STANDARD_GGUF_QUANT_TYPES, _GGUF_METADATA
 
         return {
-            "awq": {"kind": "bits", "options": [4, 8]},
-            "gptq": {"kind": "bits", "options": [4, 8]},
+            "awq": {
+                "kind": "bits",
+                "options": [4],
+                "note": "AWQ supports only 4-bit (autoawq library limitation).",
+            },
+            "gptq": {"kind": "bits", "options": [2, 3, 4, 8]},
             "k-quants": {
                 "kind": "named",
                 "options": [
@@ -1233,17 +1300,38 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
         bottom_k: int = Field(default=10, ge=1, le=200)
         metric: str = "magnitude"  # "magnitude" | "wanda"
         calibration_texts: Optional[List[str]] = None
+        # Bug fix / feature (this session): the Wanda calibration set used to
+        # be pasted-text-only (`calibration_texts`), so drawing calibration
+        # samples from real dataset files — let alone more than one of them —
+        # meant copy-pasting text into the UI by hand. This lets the panel
+        # point at one or more JSONL dataset paths instead; both can be
+        # combined (dataset-loaded texts are appended after any pasted ones).
+        calibration_dataset_paths: Optional[List[str]] = None
+        calibration_samples_per_dataset: int = Field(default=64, ge=1, le=2000)
         max_length: int = Field(default=512, ge=16, le=4096)
 
     def _run_importance_scan(job_id: str, req: "ImportanceScanRequest"):
         try:
             if req.metric == "wanda":
-                if not req.calibration_texts:
-                    raise ValueError("metric=wanda requires calibration_texts")
+                from soup_cli.utils.neuron_compress import load_calibration_texts
+
+                texts: List[str] = list(req.calibration_texts or [])
+                if req.calibration_dataset_paths:
+                    texts.extend(
+                        load_calibration_texts(
+                            req.calibration_dataset_paths,
+                            max_samples_per_file=req.calibration_samples_per_dataset,
+                        )
+                    )
+                if not texts:
+                    raise ValueError(
+                        "metric=wanda requires calibration_texts and/or "
+                        "calibration_dataset_paths"
+                    )
                 from soup_cli.utils.neuron_compress import rank_importance_wanda
 
                 results = rank_importance_wanda(
-                    req.model, req.calibration_texts, modules=req.modules, max_length=req.max_length
+                    req.model, texts, modules=req.modules, max_length=req.max_length
                 )
             else:
                 from soup_cli.utils.neuron_compress import rank_importance
