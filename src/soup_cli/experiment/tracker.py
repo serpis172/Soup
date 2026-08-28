@@ -370,6 +370,21 @@ class ExperimentTracker:
         ).fetchall()
         return [self._reconcile_orphaned_run(dict(row)) for row in rows]
 
+    def find_run_by_pid(self, pid: int) -> Optional[str]:
+        """Return the run_id of the row with status='running' and this PID,
+        if any. Used by the Web UI's /api/train/progress to find "the run
+        the currently-tracked subprocess corresponds to" without the
+        frontend having to already know a run_id — mark_running() is what
+        writes the pid in the first place.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT run_id FROM runs WHERE pid = ? AND status = 'running' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        return row["run_id"] if row else None
+
     def get_run(self, run_id: str) -> Optional[dict]:
         """Get full details of a single run. Supports prefix matching."""
         conn = self._get_conn()

@@ -28,6 +28,26 @@
       </div>
     </div>
   </div>
+
+  <!-- File/directory browser modal (this session) — a generic picker used
+       by New Training's dataset/model/output Browse buttons and the
+       Compress section's directory fields. Built once, driven entirely by
+       openFileBrowserModal()/state in app.js. -->
+  <div id="fs-browser-modal" style="display:none">
+    <div class="fs-browser-box">
+      <div class="fs-browser-header">
+        <span id="fs-browser-title">Browse</span>
+        <button class="btn btn-sm" onclick="closeFileBrowserModal()">Close</button>
+      </div>
+      <div class="fs-browser-path" id="fs-browser-path"></div>
+      <div class="fs-browser-list" id="fs-browser-list"></div>
+      <div class="fs-browser-footer">
+        <input type="text" id="fs-browser-manual" placeholder="or type a path directly...">
+        <button class="btn btn-sm" onclick="fsBrowserGo()">Go</button>
+        <button class="btn btn-primary btn-sm" id="fs-browser-select-btn" onclick="fsBrowserSelectCurrent()">Select this directory</button>
+      </div>
+    </div>
+  </div>
   <div class="app">
     <!-- Sidebar -->
     <aside class="sidebar">
@@ -55,11 +75,11 @@
         </button>
         <button class="nav-item" data-page="modelhub" onclick="navigate('modelhub')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <span>Model Hub</span>
+          <span>HF Hub</span>
         </button>
-        <button class="nav-item" data-page="compress" onclick="navigate('compress')">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
-          <span>Compress</span>
+        <button class="nav-item" data-page="help" onclick="navigate('help')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span>Help</span>
         </button>
       </nav>
       <div class="sidebar-footer" id="sidebar-version">Soup Web UI</div>
@@ -135,14 +155,269 @@
           <span id="quant-settings-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
           <div id="quant-diff" style="margin-top:0.5rem"></div>
         </div>
+
+        <!-- Compress section, merged into New Training (was a separate
+             top-level page — see CHANGELOG). Collapsed by default so it
+             doesn't dominate the page for people who just want to train. -->
+        <details class="card" id="compress-section" style="padding:0" ontoggle="if(this.open) autofillCompressDirs()">
+          <summary class="card-title" style="cursor:pointer;padding:1rem 1.25rem;margin-bottom:0">
+            Compress (optional)
+          </summary>
+          <div style="padding:0 1.25rem 1.25rem 1.25rem">
+        <div class="card">
+          <div class="empty-state-hint" style="margin-bottom:0.75rem">
+            Optional, opt-in model-density tools. Nothing here runs automatically and
+            nothing modifies a checkpoint unless you press Apply. MLP/FFN neurons only —
+            see <code>soup compress --help</code> for the CLI equivalent and full docs.
+          </div>
+          <div class="form-group">
+            <label class="form-label">Model</label>
+            <div style="display:flex;gap:0.4rem">
+              <input type="text" id="compress-model" placeholder="HF Hub id or local model directory">
+              <button class="btn btn-sm" onclick="browsePath('compress-model', {mode:'dir', label:'model directory'})">Browse</button>
+            </div>
+            <div class="empty-state-hint" style="margin-top:0.3rem">
+              Auto-filled from the training config's <code>output:</code> when you expand this
+              section, if empty — usually the checkpoint you just trained.
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Neuron importance</div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Modules</label>
+              <select id="importance-modules">
+                <option value="mlp,attn">mlp, attn</option>
+                <option value="mlp">mlp only</option>
+                <option value="attn">attn only</option>
+                <option value="all">all</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Bottom-K per layer</label>
+              <input type="number" id="importance-bottomk" value="10" min="1" max="200">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Metric</label>
+              <select id="importance-metric" onchange="onImportanceMetricChange()">
+                <option value="magnitude">Magnitude (fast, streamed, no data)</option>
+                <option value="wanda">Wanda (activation-weighted, needs calibration text)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group" id="importance-calib-group" style="display:none">
+            <label class="form-label">Calibration text (one sample per line, optional)</label>
+            <textarea id="importance-calib-text" rows="4" placeholder="A few sentences representative of your domain — 10-50 lines is usually enough."></textarea>
+            <label class="form-label" style="margin-top:0.5rem">
+              Calibration dataset files (one JSONL path per line, optional — combine as many as you like)
+            </label>
+            <textarea id="importance-calib-datasets" rows="3" placeholder="data/code_samples.jsonl&#10;data/chat_samples.jsonl&#10;data/domain_corpus.jsonl"></textarea>
+            <div class="empty-state-hint" style="margin-top:0.35rem">
+              Pooled with the pasted text above, if any. Each file contributes up to the sample
+              cap below, so one large dataset can't crowd the others out.
+            </div>
+            <label class="form-label" style="margin-top:0.5rem">Samples per dataset file</label>
+            <input type="number" id="importance-calib-samples-per-file" value="64" min="1" max="2000" style="max-width:8rem">
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runImportanceScan()">Scan importance</button>
+          <span id="importance-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="importance-results" style="margin-top:1rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Similar-neuron merging (MLP intermediate dim)</div>
+          <div class="empty-state-hint" style="margin-bottom:0.5rem">
+            Two neurons merge only when both their gate_proj and up_proj rows are highly
+            similar — safe without calibration data because that jointly implies near-identical
+            activations for any input. Measured on synthetic weights: ~0.3% median output error
+            at 0.998 similarity, ~1.3% at 0.97. Default 0.98 is conservative.
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Threshold: <span id="merge-threshold-val">0.98</span></label>
+              <input type="range" id="merge-threshold" min="0.80" max="0.999" step="0.001" value="0.98"
+                     oninput="document.getElementById('merge-threshold-val').textContent=this.value">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Max pairs / layer</label>
+              <input type="number" id="merge-maxpairs" value="50" min="1" max="1000">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Output directory (for Apply)</label>
+              <div style="display:flex;gap:0.4rem">
+                <input type="text" id="merge-outputdir" placeholder="e.g. ./output/merged-model">
+                <button class="btn btn-sm" onclick="browsePath('merge-outputdir', {mode:'dir', label:'output directory', allowNew:true})">Browse</button>
+              </div>
+            </div>
+          </div>
+          <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:var(--text-dim);margin-bottom:0.5rem">
+            <input type="checkbox" id="merge-allow-nonuniform">
+            Allow non-uniform intermediate_size (writes a checkpoint stock <code>transformers</code> can't load — advanced/custom deployments only)
+          </label>
+          <div class="form-group">
+            <label class="form-label" style="display:flex;align-items:center;gap:0.4rem">
+              <input type="checkbox" id="merge-eval-enable" onchange="document.getElementById('merge-eval-group').style.display=this.checked?'':'none'">
+              Quick eval: compare perplexity before/after on Apply (loads both models — slower)
+            </label>
+            <div id="merge-eval-group" style="display:none;margin-top:0.4rem">
+              <textarea id="merge-eval-text" rows="3" placeholder="A few evaluation sentences, one per line."></textarea>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runNeuronScan()">Find candidates</button>
+          <button class="btn btn-danger btn-sm" onclick="runNeuronApply()">Apply merge</button>
+          <span id="merge-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="merge-results" style="margin-top:1rem"></div>
+          <div id="merge-eval-result" style="margin-top:0.5rem"></div>
+          <div id="merge-distill-suggest" style="margin-top:0.75rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">SVD weight compression</div>
+          <div class="empty-state-hint" style="margin-bottom:0.5rem">
+            <strong>Denoise</strong>: replaces a matrix with its best low-rank reconstruction at the
+            <em>same shape</em> — never breaks compatibility, doesn't shrink the file, removes
+            low-signal noise. <strong>Factorize</strong>: splits a matrix into two smaller ones —
+            genuine size reduction, but the result needs custom loading code (a
+            <code>svd_manifest.json</code> documents exactly how).
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Mode</label>
+              <select id="svd-mode">
+                <option value="denoise">Denoise (safe, same shape)</option>
+                <option value="factorize">Factorize (smaller, custom loading needed)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Rank at energy retention</label>
+              <select id="svd-energy">
+                <option value="0.90">90%</option>
+                <option value="0.95" selected>95%</option>
+                <option value="0.99">99%</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Output directory (for Apply)</label>
+              <div style="display:flex;gap:0.4rem">
+                <input type="text" id="svd-outputdir" placeholder="e.g. ./output/svd-model">
+                <button class="btn btn-sm" onclick="browsePath('svd-outputdir', {mode:'dir', label:'output directory', allowNew:true})">Browse</button>
+              </div>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runSvdScan()">Analyze</button>
+          <button class="btn btn-danger btn-sm" onclick="runSvdApply()">Apply</button>
+          <span id="svd-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="svd-results" style="margin-top:1rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Distillation recovery</div>
+          <div class="empty-state-hint" style="margin-bottom:0.5rem">
+            Generates a config for the existing distillation trainer (<code>task: distill</code>) —
+            teacher/student KL distillation, already fully implemented. This just pre-fills it:
+            student = your compressed model, teacher = the original.
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Student (compressed model path)</label>
+              <input type="text" id="distill-student" placeholder="e.g. ./output/merged-model">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Teacher</label>
+              <input type="text" id="distill-teacher" placeholder="original model path or HF id">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Mode</label>
+              <select id="distill-mode">
+                <option value="token">Token-level KL</option>
+                <option value="sequence">Sequence-level (teacher-generated)</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runDistillConfig()">Generate config</button>
+          <span id="distill-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
+          <div id="distill-result" style="margin-top:0.75rem"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Compress jobs</div>
+          <div id="compress-jobs">
+            <div class="empty-state-hint">No jobs yet.</div>
+          </div>
+        </div>
+          </div>
+        </details>
+
+        <!-- Model size Calculator: estimate checkpoint size after
+             quantization and/or the Compress section's merge/SVD ratios,
+             using the same base-model param-count logic as the CLI's
+             `soup export`/GPU sizing helpers (utils/gpu.py). -->
+        <div class="card" id="calculator-section">
+          <div class="card-title">Calculator — estimated model size after training</div>
+          <div class="empty-state-hint" style="margin-bottom:0.75rem">
+            Estimates only. Real size depends on the specific weights (how compressible they
+            actually are) and exact quantization implementation details — treat this as a
+            planning number, not a guarantee.
+          </div>
+          <div class="grid-3">
+            <div class="form-group">
+              <label class="form-label">Base model (HF id or local path)</label>
+              <input type="text" id="calc-model" placeholder="e.g. meta-llama/Llama-3.1-8B-Instruct"
+                     oninput="onCalcModelInput()">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Parameters (B) — auto-filled if recognized</label>
+              <input type="number" id="calc-params-b" step="0.001" min="0.001" placeholder="e.g. 8">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Precision / quantization</label>
+              <select id="calc-precision">
+                <option value="fp32">FP32 (4 bytes/param)</option>
+                <option value="fp16" selected>FP16 / BF16 (2 bytes/param) — typical after SFT</option>
+                <option value="int8">INT8 / AWQ-8 / GPTQ-8 (1 byte/param)</option>
+                <option value="gptq4">GPTQ 4-bit (0.5 byte/param)</option>
+                <option value="gptq3">GPTQ 3-bit (0.375 byte/param)</option>
+                <option value="gptq2">GPTQ 2-bit (0.25 byte/param)</option>
+                <option value="awq4">AWQ 4-bit (0.5 byte/param)</option>
+                <option value="q8_0">GGUF Q8_0 (~1.06 byte/param)</option>
+                <option value="q5_k_m">GGUF Q5_K_M (~0.73 byte/param)</option>
+                <option value="q4_k_m">GGUF Q4_K_M (~0.63 byte/param)</option>
+                <option value="q2_k">GGUF Q2_K (~0.35 byte/param)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">
+              Compress-section reduction (optional): <span id="calc-compress-val">0%</span>
+            </label>
+            <input type="range" id="calc-compress-pct" min="0" max="50" step="1" value="0"
+                   oninput="document.getElementById('calc-compress-val').textContent=this.value+'%'; renderCalculator()">
+            <div class="empty-state-hint" style="margin-top:0.35rem">
+              Rough stand-in for the Compress section's merge/SVD size reduction — run a real
+              scan there first for an actual number specific to your model, then dial this in
+              to match.
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="renderCalculator()">Calculate</button>
+          <div id="calculator-result" style="margin-top:1rem"></div>
+        </div>
         <!-- Training Progress Bar -->
         <div id="train-progress" class="card" style="display:none">
-          <div class="card-title">Training Progress</div>
+          <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+            <span>Training Progress — <span id="progress-phase">Starting</span></span>
+            <span>
+              <button class="btn btn-sm" id="pause-resume-btn" onclick="togglePauseTraining()">Pause</button>
+              <button class="btn btn-danger btn-sm" onclick="stopTraining()">Stop</button>
+            </span>
+          </div>
           <div class="progress-bar">
             <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
           </div>
           <div class="progress-info">
             <span id="progress-step">Step 0/0</span>
+            <span id="progress-speed"></span>
             <span id="progress-elapsed">Elapsed: --</span>
             <span id="progress-eta">ETA: --</span>
           </div>
@@ -157,6 +432,11 @@
           </div>
           <pre class="log-panel" id="log-output"></pre>
         </div>
+
+        <!-- Quick Reference — moved to the bottom of the page (was squeezed
+             next to Training Status, easy to miss) and expanded to actually
+             match the current schema instead of a stale, partial list. -->
+        <div class="card" id="quick-reference-card"></div>
       </div>
 
       <!-- Data Explorer Page -->
@@ -264,10 +544,10 @@
         </div>
       </div>
 
-      <!-- Model Hub Page — HF model/dataset/benchmark search + download -->
+      <!-- HF Hub Page — HF model/dataset/benchmark search + download -->
       <div id="page-modelhub" class="page">
         <div class="page-header">
-          <h1 class="page-title">Model Hub</h1>
+          <h1 class="page-title">HF Hub</h1>
         </div>
         <div class="card">
           <div style="display:flex;gap:0.5rem;margin-bottom:1rem">
@@ -282,19 +562,49 @@
             </div>
             <div class="form-group" id="hub-task-group">
               <label class="form-label">Task</label>
-              <input type="text" id="hub-task" placeholder="text-generation">
+              <input type="text" id="hub-task" placeholder="text-generation" list="hub-task-options">
+              <datalist id="hub-task-options"></datalist>
             </div>
             <div class="form-group" id="hub-library-group">
               <label class="form-label">Library</label>
-              <input type="text" id="hub-library" placeholder="transformers, peft, gguf...">
+              <input type="text" id="hub-library" placeholder="transformers, peft, gguf..." list="hub-library-options">
+              <datalist id="hub-library-options">
+                <option value="transformers"></option>
+                <option value="peft"></option>
+                <option value="gguf"></option>
+                <option value="mlx"></option>
+                <option value="sentence-transformers"></option>
+                <option value="diffusers"></option>
+              </datalist>
             </div>
             <div class="form-group">
               <label class="form-label">Language</label>
-              <input type="text" id="hub-language" placeholder="en">
+              <input type="text" id="hub-language" placeholder="en" list="hub-language-options">
+              <datalist id="hub-language-options">
+                <option value="en"></option>
+                <option value="it"></option>
+                <option value="es"></option>
+                <option value="fr"></option>
+                <option value="de"></option>
+                <option value="zh"></option>
+                <option value="ja"></option>
+                <option value="multilingual"></option>
+              </datalist>
+              <div class="empty-state-hint" style="margin-top:0.3rem" id="hub-language-hint"></div>
             </div>
             <div class="form-group">
               <label class="form-label">License</label>
-              <input type="text" id="hub-license" placeholder="apache-2.0">
+              <input type="text" id="hub-license" placeholder="apache-2.0" list="hub-license-options">
+              <datalist id="hub-license-options">
+                <option value="apache-2.0"></option>
+                <option value="mit"></option>
+                <option value="llama3"></option>
+                <option value="llama3.1"></option>
+                <option value="gemma"></option>
+                <option value="cc-by-4.0"></option>
+                <option value="cc-by-sa-4.0"></option>
+                <option value="openrail"></option>
+              </datalist>
             </div>
             <div class="form-group">
               <label class="form-label">Sort by</label>
@@ -308,6 +618,11 @@
             </div>
           </div>
           <button class="btn btn-primary" onclick="runHubSearch()">Search</button>
+          <div class="empty-state-hint" style="margin-top:0.5rem">
+            Filters use Hugging Face Hub's own vocabulary (e.g. task = pipeline tag for models,
+            task category for datasets) — type-ahead suggestions above are common values, not an
+            exhaustive list; anything valid on huggingface.co works here too.
+          </div>
         </div>
         <div id="hub-results">
           <div class="empty-state">
@@ -323,181 +638,12 @@
         </div>
       </div>
 
-      <!-- Compress Page — optional neuron importance + similar-neuron merging -->
-      <div id="page-compress" class="page">
+      <!-- Help / Tutorial Page -->
+      <div id="page-help" class="page">
         <div class="page-header">
-          <h1 class="page-title">Compress</h1>
+          <h1 class="page-title">Help &amp; Tutorial</h1>
         </div>
-        <div class="card">
-          <div class="empty-state-hint" style="margin-bottom:0.75rem">
-            Optional, opt-in model-density tools. Nothing here runs automatically and
-            nothing modifies a checkpoint unless you press Apply. MLP/FFN neurons only —
-            see <code>soup compress --help</code> for the CLI equivalent and full docs.
-          </div>
-          <div class="form-group">
-            <label class="form-label">Model</label>
-            <input type="text" id="compress-model" placeholder="HF Hub id or local model directory">
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">Neuron importance</div>
-          <div class="grid-3">
-            <div class="form-group">
-              <label class="form-label">Modules</label>
-              <select id="importance-modules">
-                <option value="mlp,attn">mlp, attn</option>
-                <option value="mlp">mlp only</option>
-                <option value="attn">attn only</option>
-                <option value="all">all</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Bottom-K per layer</label>
-              <input type="number" id="importance-bottomk" value="10" min="1" max="200">
-            </div>
-            <div class="form-group">
-              <label class="form-label">Metric</label>
-              <select id="importance-metric" onchange="onImportanceMetricChange()">
-                <option value="magnitude">Magnitude (fast, streamed, no data)</option>
-                <option value="wanda">Wanda (activation-weighted, needs calibration text)</option>
-              </select>
-            </div>
-          </div>
-          <div class="form-group" id="importance-calib-group" style="display:none">
-            <label class="form-label">Calibration text (one sample per line, optional)</label>
-            <textarea id="importance-calib-text" rows="4" placeholder="A few sentences representative of your domain — 10-50 lines is usually enough."></textarea>
-            <label class="form-label" style="margin-top:0.5rem">
-              Calibration dataset files (one JSONL path per line, optional — combine as many as you like)
-            </label>
-            <textarea id="importance-calib-datasets" rows="3" placeholder="data/code_samples.jsonl&#10;data/chat_samples.jsonl&#10;data/domain_corpus.jsonl"></textarea>
-            <div class="empty-state-hint" style="margin-top:0.35rem">
-              Pooled with the pasted text above, if any. Each file contributes up to the sample
-              cap below, so one large dataset can't crowd the others out.
-            </div>
-            <label class="form-label" style="margin-top:0.5rem">Samples per dataset file</label>
-            <input type="number" id="importance-calib-samples-per-file" value="64" min="1" max="2000" style="max-width:8rem">
-          </div>
-          <button class="btn btn-primary btn-sm" onclick="runImportanceScan()">Scan importance</button>
-          <span id="importance-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
-          <div id="importance-results" style="margin-top:1rem"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">Similar-neuron merging (MLP intermediate dim)</div>
-          <div class="empty-state-hint" style="margin-bottom:0.5rem">
-            Two neurons merge only when both their gate_proj and up_proj rows are highly
-            similar — safe without calibration data because that jointly implies near-identical
-            activations for any input. Measured on synthetic weights: ~0.3% median output error
-            at 0.998 similarity, ~1.3% at 0.97. Default 0.98 is conservative.
-          </div>
-          <div class="grid-3">
-            <div class="form-group">
-              <label class="form-label">Threshold: <span id="merge-threshold-val">0.98</span></label>
-              <input type="range" id="merge-threshold" min="0.80" max="0.999" step="0.001" value="0.98"
-                     oninput="document.getElementById('merge-threshold-val').textContent=this.value">
-            </div>
-            <div class="form-group">
-              <label class="form-label">Max pairs / layer</label>
-              <input type="number" id="merge-maxpairs" value="50" min="1" max="1000">
-            </div>
-            <div class="form-group">
-              <label class="form-label">Output directory (for Apply)</label>
-              <input type="text" id="merge-outputdir" placeholder="e.g. ./output/merged-model">
-            </div>
-          </div>
-          <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85rem;color:var(--text-dim);margin-bottom:0.5rem">
-            <input type="checkbox" id="merge-allow-nonuniform">
-            Allow non-uniform intermediate_size (writes a checkpoint stock <code>transformers</code> can't load — advanced/custom deployments only)
-          </label>
-          <div class="form-group">
-            <label class="form-label" style="display:flex;align-items:center;gap:0.4rem">
-              <input type="checkbox" id="merge-eval-enable" onchange="document.getElementById('merge-eval-group').style.display=this.checked?'':'none'">
-              Quick eval: compare perplexity before/after on Apply (loads both models — slower)
-            </label>
-            <div id="merge-eval-group" style="display:none;margin-top:0.4rem">
-              <textarea id="merge-eval-text" rows="3" placeholder="A few evaluation sentences, one per line."></textarea>
-            </div>
-          </div>
-          <button class="btn btn-primary btn-sm" onclick="runNeuronScan()">Find candidates</button>
-          <button class="btn btn-danger btn-sm" onclick="runNeuronApply()">Apply merge</button>
-          <span id="merge-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
-          <div id="merge-results" style="margin-top:1rem"></div>
-          <div id="merge-eval-result" style="margin-top:0.5rem"></div>
-          <div id="merge-distill-suggest" style="margin-top:0.75rem"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">SVD weight compression</div>
-          <div class="empty-state-hint" style="margin-bottom:0.5rem">
-            <strong>Denoise</strong>: replaces a matrix with its best low-rank reconstruction at the
-            <em>same shape</em> — never breaks compatibility, doesn't shrink the file, removes
-            low-signal noise. <strong>Factorize</strong>: splits a matrix into two smaller ones —
-            genuine size reduction, but the result needs custom loading code (a
-            <code>svd_manifest.json</code> documents exactly how).
-          </div>
-          <div class="grid-3">
-            <div class="form-group">
-              <label class="form-label">Mode</label>
-              <select id="svd-mode">
-                <option value="denoise">Denoise (safe, same shape)</option>
-                <option value="factorize">Factorize (smaller, custom loading needed)</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Rank at energy retention</label>
-              <select id="svd-energy">
-                <option value="0.90">90%</option>
-                <option value="0.95" selected>95%</option>
-                <option value="0.99">99%</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Output directory (for Apply)</label>
-              <input type="text" id="svd-outputdir" placeholder="e.g. ./output/svd-model">
-            </div>
-          </div>
-          <button class="btn btn-primary btn-sm" onclick="runSvdScan()">Analyze</button>
-          <button class="btn btn-danger btn-sm" onclick="runSvdApply()">Apply</button>
-          <span id="svd-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
-          <div id="svd-results" style="margin-top:1rem"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">Distillation recovery</div>
-          <div class="empty-state-hint" style="margin-bottom:0.5rem">
-            Generates a config for the existing distillation trainer (<code>task: distill</code>) —
-            teacher/student KL distillation, already fully implemented. This just pre-fills it:
-            student = your compressed model, teacher = the original.
-          </div>
-          <div class="grid-3">
-            <div class="form-group">
-              <label class="form-label">Student (compressed model path)</label>
-              <input type="text" id="distill-student" placeholder="e.g. ./output/merged-model">
-            </div>
-            <div class="form-group">
-              <label class="form-label">Teacher</label>
-              <input type="text" id="distill-teacher" placeholder="original model path or HF id">
-            </div>
-            <div class="form-group">
-              <label class="form-label">Mode</label>
-              <select id="distill-mode">
-                <option value="token">Token-level KL</option>
-                <option value="sequence">Sequence-level (teacher-generated)</option>
-              </select>
-            </div>
-          </div>
-          <button class="btn btn-primary btn-sm" onclick="runDistillConfig()">Generate config</button>
-          <span id="distill-status" style="margin-left:0.75rem;font-size:0.85rem;color:var(--text-dim)"></span>
-          <div id="distill-result" style="margin-top:0.75rem"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">Compress jobs</div>
-          <div id="compress-jobs">
-            <div class="empty-state-hint">No jobs yet.</div>
-          </div>
-        </div>
+        <div id="help-content"></div>
       </div>
 
     </main>

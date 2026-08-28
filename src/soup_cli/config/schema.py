@@ -6552,13 +6552,18 @@ class SoupConfig(BaseModel):
 TEMPLATES: dict[str, str] = {
     "chat": """# Soup template: Chat Assistant
 # Fine-tune a model for conversational chat
+#
+# data.train below points at the bundled example fixture so this template
+# runs end-to-end out of the box (proves your setup works — it will NOT
+# produce a useful model from just 10 rows). Point it at your own dataset
+# for real training. See examples/data/README.md.
 
 base: meta-llama/Llama-3.1-8B-Instruct
 task: sft
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/train.jsonl
+  train: examples/data/alpaca_tiny.jsonl
   format: alpaca
   val_split: 0.1
   max_length: 2048
@@ -6577,13 +6582,18 @@ output: ./output
 """,
     "code": """# Soup template: Code Model
 # Fine-tune a model for code generation / completion
+#
+# PLACEHOLDER PATH — data.train below does not exist in a fresh checkout.
+# No code-specific fixture ships with Soup; point this at your own dataset
+# before training (see examples/data/README.md for format examples/soup
+# data search to find one on the HF Hub).
 
 base: codellama/CodeLlama-7b-Instruct-hf
 task: sft
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/code_train.jsonl
+  train: ./data/code_train.jsonl  # <-- change this to your dataset
   format: alpaca
   val_split: 0.1
   max_length: 4096
@@ -6602,14 +6612,19 @@ output: ./output
 """,
     "reasoning": """# Soup template: Reasoning / GRPO
 # Fine-tune a model for chain-of-thought reasoning with GRPO
+#
+# data.train below points at the bundled example fixture (worked math
+# solutions, alpaca-shaped) so this template runs end-to-end out of the
+# box — it will NOT produce a useful model from just 5 rows. Point it at
+# your own dataset for real training. See examples/data/README.md.
 
 base: meta-llama/Llama-3.1-8B-Instruct
 task: grpo
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/reasoning_train.jsonl
-  format: sharegpt
+  train: examples/data/reasoning_math.jsonl
+  format: alpaca
   val_split: 0.1
   max_length: 4096
 
@@ -6631,6 +6646,11 @@ output: ./output
 """,
     "vision": """# Soup template: Vision / Multimodal
 # Fine-tune a vision-language model for image understanding
+#
+# PLACEHOLDER PATH — data.train and image_dir below do not exist in a
+# fresh checkout. No vision fixture ships with Soup (image data doesn't
+# fit as a small bundled example); point these at your own dataset before
+# training. See docs/data.md for the llava format.
 
 base: meta-llama/Llama-3.2-11B-Vision-Instruct
 task: sft
@@ -6638,9 +6658,9 @@ modality: vision
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/vision_train.jsonl
+  train: ./data/vision_train.jsonl  # <-- change this to your dataset
   format: llava
-  image_dir: ./data/images
+  image_dir: ./data/images  # <-- change this to your images
   val_split: 0.1
   max_length: 2048
 
@@ -6658,13 +6678,18 @@ output: ./output
 """,
     "medical": """# Soup template: Medical / Domain Expert
 # Fine-tune a model with domain-specific knowledge
+#
+# PLACEHOLDER PATH — data.train below does not exist in a fresh checkout.
+# No domain-specific fixture ships with Soup; point this at your own
+# dataset before training (see examples/data/README.md, or soup data
+# search to find one on the HF Hub).
 
 base: meta-llama/Llama-3.1-8B-Instruct
 task: sft
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/medical_train.jsonl
+  train: ./data/medical_train.jsonl  # <-- change this to your dataset
   format: alpaca
   val_split: 0.15
   max_length: 2048
@@ -6694,7 +6719,7 @@ task: kto
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/kto_train.jsonl
+  train: ./data/kto_train.jsonl  # <-- change this to your dataset
   format: kto
   val_split: 0.1
   max_length: 2048
@@ -6724,7 +6749,7 @@ task: orpo
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/preference_train.jsonl
+  train: examples/data/chat_preferences.jsonl
   format: dpo
   val_split: 0.1
   max_length: 2048
@@ -6754,7 +6779,7 @@ task: bco
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/preference_train.jsonl
+  train: examples/data/chat_preferences.jsonl
   format: dpo
   val_split: 0.1
   max_length: 2048
@@ -6784,7 +6809,7 @@ task: simpo
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/preference_train.jsonl
+  train: examples/data/chat_preferences.jsonl
   format: dpo
   val_split: 0.1
   max_length: 2048
@@ -6815,7 +6840,7 @@ task: ipo
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/preference_train.jsonl
+  train: examples/data/chat_preferences.jsonl
   format: dpo
   val_split: 0.1
   max_length: 2048
@@ -6847,7 +6872,7 @@ task: pretrain
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/corpus.jsonl
+  train: ./data/corpus.jsonl  # <-- change this to your dataset
   format: plaintext
   val_split: 0.05
   max_length: 4096
@@ -6875,7 +6900,7 @@ task: sft
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/train.jsonl
+  train: ./data/train.jsonl  # <-- change this to your dataset
   format: alpaca
   val_split: 0.1
   max_length: 2048
@@ -6906,7 +6931,7 @@ task: sft
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/long_context_train.jsonl
+  train: ./data/long_context_train.jsonl  # <-- change this to your dataset
   format: alpaca
   val_split: 0.05
   max_length: 131072
@@ -6943,7 +6968,7 @@ task: embedding
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/embedding_train.jsonl
+  train: ./data/embedding_train.jsonl  # <-- change this to your dataset
   format: embedding
   val_split: 0.1
   max_length: 512
@@ -6980,7 +7005,7 @@ modality: audio
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/audio_train.jsonl
+  train: ./data/audio_train.jsonl  # <-- change this to your dataset
   format: audio
   audio_dir: ./data/audio
   val_split: 0.1
@@ -7021,7 +7046,7 @@ task: sft
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/tool_calling_train.jsonl
+  train: ./data/tool_calling_train.jsonl  # <-- change this to your dataset
   format: tool-calling
   val_split: 0.1
   max_length: 4096
@@ -7055,7 +7080,7 @@ task: ppo
 # backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
 
 data:
-  train: ./data/prompts.jsonl
+  train: ./data/prompts.jsonl  # <-- change this to your dataset
   format: chatml
   val_split: 0.1
   max_length: 2048

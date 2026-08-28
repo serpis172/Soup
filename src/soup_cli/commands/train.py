@@ -1259,6 +1259,13 @@ def train(
         run_id=os.environ.get("SOUP_MCP_RUN_ID") or None,
     )
     console.print(f"[dim]Run ID: {run_id}[/]")
+    # Record this process's own PID against the run row so
+    # ExperimentTracker.find_run_by_pid can map a tracked subprocess (e.g.
+    # the Web UI's /api/train/start, which only ever sees a PID — never a
+    # run_id, since it invokes `soup train` as a subprocess) back to its
+    # run_id. Without this, /api/train/progress had no way to find step/
+    # loss/speed for the run it's watching.
+    tracker.mark_running(run_id, pid=os.getpid())
 
     # Build trainer based on task type
     from soup_cli.utils.trackers import resolve_report_to

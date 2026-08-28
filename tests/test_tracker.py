@@ -239,3 +239,46 @@ def test_config_json_stored(tracker):
     recovered = json.loads(run["config_json"])
     assert recovered["base"] == "meta-llama/Llama-3.1-8B"
     assert recovered["training"]["epochs"] == 3
+
+
+# --- find_run_by_pid (this session's Web UI progress-tracking gap fix) ---
+
+
+def test_find_run_by_pid_returns_run_after_mark_running(tracker):
+    """The chain start_run() -> mark_running() -> find_run_by_pid() is what
+    /api/train/progress relies on to map a tracked subprocess PID (the only
+    thing the Web UI's /api/train/start ever has) back to a run_id — this
+    would return None the whole time if either half of the chain were
+    missing or wired to a different column.
+    """
+    run_id = tracker.start_run(
+        config_dict={"base": "some-model", "task": "sft"},
+        device="cpu",
+        device_name="test",
+        gpu_info={},
+    )
+    assert tracker.find_run_by_pid(12345) is None  # not marked running yet
+
+    tracker.mark_running(run_id, pid=12345)
+    assert tracker.find_run_by_pid(12345) == run_id
+
+
+def test_find_run_by_pid_ignores_finished_runs(tracker):
+    """A finished run's PID must not still match — the process is gone and
+    that PID number could since have been reused by something unrelated."""
+    run_id = tracker.start_run(
+        config_dict={"base": "some-model", "task": "sft"},
+        device="cpu",
+        device_name="test",
+        gpu_info={},
+    )
+    tracker.mark_running(run_id, pid=999)
+    tracker.finish_run(
+        run_id, initial_loss=1.0, final_loss=0.5,
+        total_steps=10, duration_secs=5.0, output_dir="./out",
+    )
+    assert tracker.find_run_by_pid(999) is None
+
+
+def test_find_run_by_pid_no_match_returns_none(tracker):
+    assert tracker.find_run_by_pid(424242) is None

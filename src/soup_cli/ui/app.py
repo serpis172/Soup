@@ -4,6 +4,7 @@ import json as json_mod
 import logging
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,10 @@ class TrainStatus(PydanticBaseModel):
     running: bool
     pid: Optional[int] = None
     config_path: Optional[str] = None
+    paused: bool = False
+    phase: Optional[str] = None
+    total_steps: Optional[int] = None
+    exit_code: Optional[int] = None
 
 
 class DataInspectRequest(PydanticBaseModel):
@@ -45,6 +50,116 @@ class DataInspectRequest(PydanticBaseModel):
 _train_process: Optional[subprocess.Popen] = None
 _train_config_path: Optional[str] = None
 _train_lock = threading.Lock()
+_train_paused = False
+_train_total_steps_estimate: Optional[int] = None
+
+# Shared, in-memory log buffer for the current training run + the thread
+# that fills it.
+#
+# Bug fix (this session): /api/train/logs used to iterate `proc.stdout`
+# DIRECTLY, only while an SSE client happened to be connected. `stdout` was
+# piped (subprocess.PIPE) but never otherwise read — the OS pipe buffer is
+# small (~64KB on Linux), so a training run producing more than that much
+# stdout with nobody watching the log page would block on its next write
+# and hang silently, forever, indistinguishable from "still training" in
+# /api/train/status (poll() stays None). This background thread is the one
+# and only reader of proc.stdout for the lifetime of the process — started
+# unconditionally in /api/train/start, whether or not anyone ever opens the
+# logs SSE stream — so the pipe can never back up. /api/train/logs and the
+# phase-detection in /api/train/progress both read from `_train_log_buffer`
+# instead of the pipe directly.
+_train_log_buffer: List[str] = []
+_train_log_lock = threading.Lock()
+_train_log_thread: Optional[threading.Thread] = None
+
+# Coarse phase labels inferred from known log-line substrings the trainer
+# prints at each stage (see commands/train.py) — checked in order, most
+# recently matched wins. "Training" is NOT in this table: it's detected
+# from the experiment tracker actually having a metrics row for the run,
+# which is a far more reliable signal than matching log text for it.
+_PHASE_MARKERS = [
+    ("Loading config from", "Loading config"),
+    ("Verifying datasets", "Verifying datasets"),
+    ("Loading dataset", "Loading dataset"),
+    ("Setting up model + trainer", "Setting up model + trainer"),
+    ("Loaded:", "Dataset loaded"),
+]
+
+
+def _drain_training_stdout(proc: subprocess.Popen) -> None:
+    """Background thread body: continuously read `proc.stdout` into
+    `_train_log_buffer` for the lifetime of the process. See the module-level
+    comment above `_train_log_buffer` for why this must run unconditionally.
+    """
+    try:
+        for raw_line in proc.stdout:
+            text = (
+                raw_line.decode("utf-8", errors="replace")
+                if isinstance(raw_line, bytes)
+                else raw_line
+            ).rstrip("\n\r")
+            with _train_log_lock:
+                _train_log_buffer.append(text)
+    except (ValueError, OSError):
+        pass
+
+
+def _detect_phase(log_tail: List[str]) -> Optional[str]:
+    """Best-effort phase label from the most recent matching marker in
+    `log_tail`. Scans newest-first so a later stage's marker always wins
+    over an earlier one still sitting in the tail."""
+    for line in reversed(log_tail):
+        for marker, label in _PHASE_MARKERS:
+            if marker in line:
+                return label
+    return None
+
+
+def _estimate_total_steps(config) -> Optional[int]:
+    """Best-effort `epochs * (train_rows / effective_batch_size)` estimate,
+    for a determinate progress bar / ETA in the UI. Returns None (shown as
+    "unknown" in the UI — step count and speed still display without a
+    percentage) whenever it can't be computed cheaply and reliably:
+
+    - `training.batch_size == "auto"` — the real batch size is only known
+      once the trainer's runtime GPU-memory probing picks one.
+    - any `data.train` source that isn't a local, existing `.jsonl` file —
+      HF dataset names and remote URIs would need a network fetch just to
+      count rows, which this best-effort estimate shouldn't trigger as a
+      side effect of clicking "Start Training".
+    """
+    try:
+        tcfg = config.training
+        if not isinstance(tcfg.batch_size, int):
+            return None
+
+        train_sources = config.data.train
+        if isinstance(train_sources, str):
+            train_sources = [train_sources]
+
+        total_rows = 0
+        for src in train_sources:
+            p = Path(src)
+            if p.suffix != ".jsonl" or not p.exists():
+                return None
+            with open(p, encoding="utf-8") as fh:
+                total_rows += sum(1 for line in fh if line.strip())
+        if total_rows == 0:
+            return None
+
+        if not config.data.val:
+            total_rows = int(total_rows * (1.0 - config.data.val_split))
+        if total_rows <= 0:
+            return None
+
+        effective_batch = max(1, tcfg.batch_size * tcfg.gradient_accumulation_steps)
+        steps_per_epoch = max(1, total_rows // effective_batch)
+        return steps_per_epoch * tcfg.epochs
+    except Exception:
+        # Best-effort only — any unexpected shape (custom config subclass,
+        # future field changes) degrades to "unknown", never a 500.
+        return None
+
 
 # Auth token generated at startup — printed to console for the user.
 # Reads/writes go through `_auth_token_lock` so token rotation never
@@ -273,7 +388,8 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
 
     @app.post("/api/train/start", dependencies=[Depends(_verify_token)])
     def start_training(req: TrainRequest):
-        global _train_process, _train_config_path
+        global _train_process, _train_config_path, _train_log_thread, _train_paused
+        global _train_total_steps_estimate
 
         with _train_lock:
             if _train_process and _train_process.poll() is None:
@@ -285,12 +401,22 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             from soup_cli.config.loader import load_config_from_string
 
             try:
-                load_config_from_string(req.config_yaml)
+                config = load_config_from_string(req.config_yaml)
             except Exception as exc:
+                # Bug fix (this session): this used to collapse every
+                # validation failure into a bare "Invalid training
+                # configuration" with the real reason only in the server
+                # log — the person clicking Start Training had no way to
+                # see WHAT was wrong (missing required field, bad
+                # base/data.train type, an incompatible objectives/task
+                # combination, etc.) without going and reading server
+                # console output they likely don't have open. Mirrors what
+                # /api/config/validate already does with the same
+                # exception (pydantic's message is structural — field
+                # names/expected types — not sensitive).
                 logger.warning("Invalid training config: %s", exc)
-                raise HTTPException(
-                    status_code=400, detail="Invalid training configuration"
-                )
+                raise HTTPException(status_code=400, detail=str(exc))
+            _train_total_steps_estimate = _estimate_total_steps(config)
 
             # Securely-created temp file. A FIXED name in the shared temp dir
             # let a local attacker pre-place a symlink there and redirect this
@@ -303,36 +429,107 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
                 fh.write(req.config_yaml)
 
             _train_config_path = config_path
+            _train_paused = False
             _train_process = subprocess.Popen(
                 [sys.executable, "-m", "soup_cli", "train", "--config", config_path, "--yes"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
+            with _train_log_lock:
+                _train_log_buffer.clear()
+            # Unconditional drain thread — see _train_log_buffer's module
+            # comment for why this can't be "only when someone's watching".
+            _train_log_thread = threading.Thread(
+                target=_drain_training_stdout, args=(_train_process,), daemon=True
+            )
+            _train_log_thread.start()
             return {"started": True, "pid": _train_process.pid}
 
     @app.get("/api/train/status")
     def train_status():
         global _train_process
         with _train_lock:
-            if _train_process is None:
-                return TrainStatus(running=False)
-            poll = _train_process.poll()
-            if poll is None:
-                return TrainStatus(
-                    running=True,
-                    pid=_train_process.pid,
-                    config_path=_train_config_path,
-                )
-            return TrainStatus(running=False, pid=_train_process.pid)
+            proc = _train_process
+            paused = _train_paused
+        if proc is None:
+            return TrainStatus(running=False)
+        poll = proc.poll()
+        if poll is None:
+            with _train_log_lock:
+                tail = list(_train_log_buffer[-50:])
+            phase = "Paused" if paused else (_detect_phase(tail) or "Starting")
+            return TrainStatus(
+                running=True,
+                pid=proc.pid,
+                config_path=_train_config_path,
+                paused=paused,
+                phase=phase,
+            )
+        return TrainStatus(running=False, pid=proc.pid, exit_code=poll)
 
     @app.post("/api/train/stop", dependencies=[Depends(_verify_token)])
     def stop_training():
-        global _train_process
+        global _train_process, _train_paused
         with _train_lock:
             if _train_process and _train_process.poll() is None:
+                if _train_paused:
+                    # A SIGSTOP'd process can't act on SIGTERM until resumed
+                    # first — send SIGCONT so terminate() actually takes
+                    # effect instead of leaving a stopped zombie-in-place.
+                    try:
+                        os.kill(_train_process.pid, signal.SIGCONT)
+                    except OSError:
+                        pass
+                    _train_paused = False
                 _train_process.terminate()
                 return {"stopped": True}
             return {"stopped": False, "detail": "No training in progress"}
+
+    @app.post("/api/train/pause", dependencies=[Depends(_verify_token)])
+    def pause_training():
+        """Pause the training subprocess via SIGSTOP (POSIX).
+
+        This suspends the OS process — no gradient step is left half-applied,
+        since the kernel simply stops scheduling the process, mid-instruction
+        boundary is irrelevant at this granularity. It is NOT the same as a
+        trainer-level checkpoint-and-resume: GPU memory (model, optimizer
+        state, activations) stays allocated for the whole pause, so this
+        frees compute, not VRAM. For releasing VRAM, stop the run properly
+        and resume from a checkpoint instead (training.resume_from).
+        """
+        global _train_paused
+        with _train_lock:
+            if not _train_process or _train_process.poll() is not None:
+                raise HTTPException(status_code=409, detail="No training in progress")
+            if _train_paused:
+                return {"paused": True, "detail": "Already paused"}
+            if not hasattr(signal, "SIGSTOP"):
+                raise HTTPException(
+                    status_code=501,
+                    detail="Pause is unavailable on this OS (needs POSIX SIGSTOP/SIGCONT).",
+                )
+            try:
+                os.kill(_train_process.pid, signal.SIGSTOP)
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"Could not pause: {exc}")
+            _train_paused = True
+            return {"paused": True}
+
+    @app.post("/api/train/resume", dependencies=[Depends(_verify_token)])
+    def resume_training():
+        """Resume a training subprocess previously paused via `/api/train/pause`."""
+        global _train_paused
+        with _train_lock:
+            if not _train_process or _train_process.poll() is not None:
+                raise HTTPException(status_code=409, detail="No training in progress")
+            if not _train_paused:
+                return {"paused": False, "detail": "Not paused"}
+            try:
+                os.kill(_train_process.pid, signal.SIGCONT)
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"Could not resume: {exc}")
+            _train_paused = False
+            return {"paused": False}
 
     # --- Data Inspection ---
 
@@ -388,7 +585,15 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
 
     @app.get("/api/train/logs")
     def stream_training_logs(request: Request):
-        """SSE endpoint streaming training log lines in real time."""
+        """SSE endpoint streaming training log lines in real time.
+
+        Reads from `_train_log_buffer` (filled by the unconditional drain
+        thread started in /api/train/start), not `proc.stdout` directly —
+        see that buffer's module-level comment. Polls the buffer instead of
+        blocking on pipe reads, so multiple concurrent SSE clients (and the
+        phase detector in /api/train/progress) can all read the same
+        buffered history independently without racing each other for lines.
+        """
         from fastapi.responses import StreamingResponse
 
         last_event_id = request.headers.get("Last-Event-ID")
@@ -397,28 +602,37 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             skip_count = int(last_event_id) + 1
 
         def _generate_log_events():
-            line_index = 0
             with _train_lock:
                 proc = _train_process
             if proc is None:
                 yield "event: done\ndata: {}\n\n"
                 return
 
-            try:
-                for raw_line in proc.stdout:
-                    if isinstance(raw_line, bytes):
-                        raw_line = raw_line.decode("utf-8", errors="replace")
-                    text = raw_line.rstrip("\n\r")
-                    if line_index < skip_count:
-                        line_index += 1
-                        continue
+            line_index = skip_count
+            while True:
+                with _train_log_lock:
+                    new_lines = _train_log_buffer[line_index:]
+                for text in new_lines:
                     data = json_mod.dumps({"line": text, "id": line_index})
                     yield f"id: {line_index}\ndata: {data}\n\n"
                     line_index += 1
-            except (ValueError, OSError):
-                pass
 
-            yield "event: done\ndata: {}\n\n"
+                with _train_lock:
+                    still_running = proc.poll() is None
+                if not still_running:
+                    # One more drain pass in case a few lines landed in the
+                    # buffer between the poll() above and the thread's last
+                    # write, then close out.
+                    with _train_log_lock:
+                        trailing = _train_log_buffer[line_index:]
+                    for text in trailing:
+                        data = json_mod.dumps({"line": text, "id": line_index})
+                        yield f"id: {line_index}\ndata: {data}\n\n"
+                        line_index += 1
+                    yield "event: done\ndata: {}\n\n"
+                    return
+
+                time.sleep(0.4)
 
         return StreamingResponse(
             _generate_log_events(),
@@ -505,16 +719,42 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
     def train_progress(
         run_id: Optional[str] = Query(default=None),
     ):
-        """Return current training progress snapshot."""
-        # Read the shared process handle under the lock, like every sibling
-        # endpoint (start/status/stop) — avoids a torn read racing a concurrent
-        # start/stop.
+        """Return current training progress snapshot: step/loss/speed from
+        the experiment tracker, a best-effort total_steps/eta_seconds (see
+        `_estimate_total_steps`), the coarse phase label, and pause state.
+        """
         with _train_lock:
             proc = _train_process
+            paused = _train_paused
         is_running = proc is not None and proc.poll() is None
 
+        with _train_log_lock:
+            tail = list(_train_log_buffer[-50:])
+        phase = "Paused" if (is_running and paused) else _detect_phase(tail)
+
+        base = {
+            "running": is_running,
+            "paused": paused,
+            "phase": phase,
+            "total_steps": _train_total_steps_estimate,
+        }
+
         if not is_running and run_id is None:
-            return {"running": False, "current_step": 0, "run_id": None}
+            return {**base, "current_step": 0, "run_id": None}
+
+        # Auto-discover run_id from the tracked subprocess's PID when the
+        # caller doesn't already know it — the New Training page's progress
+        # poller doesn't (nothing in the frontend previously tracked a
+        # run_id at all), so without this, step/loss/speed/eta could never
+        # populate for it even though the tracker had them the whole time.
+        if run_id is None and is_running and proc is not None:
+            from soup_cli.experiment.tracker import ExperimentTracker
+
+            tracker = ExperimentTracker()
+            try:
+                run_id = tracker.find_run_by_pid(proc.pid)
+            finally:
+                tracker.close()
 
         if run_id:
             from soup_cli.experiment.tracker import ExperimentTracker
@@ -522,17 +762,33 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             tracker = ExperimentTracker()
             try:
                 metrics = tracker.get_metrics(run_id)
-                current_step = metrics[-1]["step"] if metrics else 0
+                latest = metrics[-1] if metrics else None
             finally:
                 tracker.close()
 
+            current_step = latest["step"] if latest else 0
+            speed = latest.get("speed") if latest else None
+            eta_seconds = None
+            if (
+                speed and speed > 0
+                and _train_total_steps_estimate
+                and _train_total_steps_estimate > current_step
+            ):
+                eta_seconds = (_train_total_steps_estimate - current_step) / speed
+            if current_step > 0:
+                phase = "Training"
+
             return {
-                "running": is_running,
+                **base,
+                "phase": phase,
                 "current_step": current_step,
                 "run_id": run_id,
+                "loss": latest.get("loss") if latest else None,
+                "speed": speed,
+                "eta_seconds": eta_seconds,
             }
 
-        return {"running": is_running, "current_step": 0, "run_id": None}
+        return {**base, "current_step": 0, "run_id": None}
 
     # --- Config Builder ---
 
@@ -630,8 +886,10 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             load_config_from_string(yaml_str)
             return {"yaml": yaml_str}
         except (ValueError, TypeError) as exc:
+            # Bug fix (this session): same "swallowed real error" pattern
+            # as /api/train/start had — see that endpoint's comment.
             logger.warning("Config form validation error: %s", exc)
-            return {"error": "Invalid configuration"}
+            return {"error": str(exc)}
 
     # --- Chat Proxy ---
 
@@ -1057,12 +1315,24 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
     # Download writes to disk, so it requires the Bearer token like every
     # other mutating endpoint.
 
-    def _hf_build_filter(library: Optional[str], license_: Optional[str]) -> Optional[list]:
+    def _hf_build_filter(
+        library: Optional[str], license_: Optional[str], language: Optional[str] = None
+    ) -> Optional[list]:
+        """Build a Hub tag-filter list. `language` used to only be wired for
+        dataset search (list_datasets has a native `language=` kwarg) — the
+        Models tab showed the same Language field but silently dropped it,
+        since list_models has no equivalent native kwarg. HF Hub models
+        that declare a language do so via a `language:<code>` tag though,
+        same mechanism as library/license here, so this now works for
+        models too instead of only appearing to.
+        """
         tags = []
         if library:
             tags.append(f"library:{library}")
         if license_:
             tags.append(f"license:{license_}")
+        if language:
+            tags.append(f"language:{language}")
         return tags or None
 
     def _hf_model_card(info) -> dict:
@@ -1089,11 +1359,82 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             "tags": list(info.tags or [])[:12],
         }
 
+    @app.get("/api/fs/browse", dependencies=[Depends(_verify_token)])
+    def browse_filesystem(
+        path: str = Query(default="."),
+        extensions: Optional[str] = Query(
+            default=None, description="comma-separated, e.g. .jsonl,.json — files only, dirs always shown"
+        ),
+    ):
+        """List directories (and matching files, if `extensions` given)
+        under `path` — backs the New Training page's dataset/model/output
+        Browse buttons (this session), so paths can be picked from a real
+        listing instead of typed/remembered exactly.
+        """
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        try:
+            p = p.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Cannot resolve path: {exc}")
+        if not p.exists():
+            raise HTTPException(status_code=404, detail=f"Path not found: {p}")
+        if not p.is_dir():
+            p = p.parent  # browsing a file path -> show its containing directory
+
+        ext_filter = None
+        if extensions:
+            ext_filter = {e.strip().lower() for e in extensions.split(",") if e.strip()}
+
+        entries = []
+        try:
+            children = sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower()))
+        except PermissionError:
+            raise HTTPException(status_code=403, detail=f"Permission denied: {p}")
+        for child in children:
+            if child.name.startswith("."):
+                continue  # dotfiles/dirs are noise for this picker
+            try:
+                if child.is_dir():
+                    entries.append({"name": child.name, "type": "dir", "path": str(child)})
+                elif ext_filter is None or child.suffix.lower() in ext_filter:
+                    entries.append({
+                        "name": child.name, "type": "file", "path": str(child),
+                        "size": child.stat().st_size,
+                    })
+            except OSError:
+                continue  # broken symlink or similar — skip, don't fail the whole listing
+
+        return {
+            "path": str(p),
+            "parent": str(p.parent) if p.parent != p else None,
+            "entries": entries,
+        }
+
+    @app.get("/api/calculator/model-size")
+    def calculator_model_size(model: str = Query(...)):
+        """Best-effort parameter count (in billions) for the Calculator
+        section, reusing the same logic `soup`'s own GPU-sizing helpers use
+        (utils.gpu.model_size_from_name): reads a local checkpoint's actual
+        config.json when `model` is a local path, otherwise parses the
+        parameter count out of the model name (e.g. "...-8B-..." -> 8.0) —
+        a heuristic, not exact, for anything not already downloaded.
+        """
+        from soup_cli.utils.gpu import model_size_from_name
+
+        try:
+            params_b = model_size_from_name(model)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"model": model, "params_b": params_b}
+
     @app.get("/api/hf/models/search")
     def hf_search_models(
         q: Optional[str] = Query(default=None),
         task: Optional[str] = Query(default=None, description="pipeline_tag, e.g. text-generation"),
         library: Optional[str] = Query(default=None, description="e.g. transformers, peft, gguf"),
+        language: Optional[str] = Query(default=None, description="e.g. en, it, multilingual"),
         license: Optional[str] = Query(default=None),  # noqa: A002 - HF's own vocabulary
         sort: str = Query(default="downloads"),
         limit: int = Query(default=30, ge=1, le=100),
@@ -1107,7 +1448,7 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             results = HfApi().list_models(
                 search=q or None,
                 pipeline_tag=task or None,
-                filter=_hf_build_filter(library, license),
+                filter=_hf_build_filter(library, license, language),
                 sort=sort,
                 limit=limit,
             )
